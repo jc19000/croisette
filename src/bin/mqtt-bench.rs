@@ -148,12 +148,13 @@ fn flow(args: &Args, addr: SocketAddr, pid: u32) {
     let stop = Arc::new(AtomicBool::new(false));
     let measuring = Arc::new(AtomicBool::new(false));
     let sent = Arc::new(AtomicU64::new(0));
-    let start = Arc::new(Barrier::new(2 * threads + 1));
+    let (readers_n, writers_n) = (threads.min(subs).max(1), threads.min(pubs).max(1));
+    let start = Arc::new(Barrier::new(readers_n + writers_n + 1));
 
     // Subscriber threads: spin over their non-blocking sockets.
-    let readers: Vec<_> = (0..threads)
+    let readers: Vec<_> = (0..readers_n)
         .map(|t| {
-            let mine: Vec<Client> = (0..sub_clients.len()).rev().filter(|i| i % threads == t).map(|i| sub_clients.swap_remove(i)).collect();
+            let mine: Vec<Client> = (0..sub_clients.len()).rev().filter(|i| i % readers_n == t).map(|i| sub_clients.swap_remove(i)).collect();
             let (stop, measuring, start) = (stop.clone(), measuring.clone(), start.clone());
             thread::spawn(move || {
                 let mut mine = mine;
@@ -183,14 +184,14 @@ fn flow(args: &Args, addr: SocketAddr, pid: u32) {
         .collect();
 
     // Publisher threads: open loop at rate / threads each.
-    let writers: Vec<_> = (0..threads)
+    let writers: Vec<_> = (0..writers_n)
         .map(|t| {
-            let ids: Vec<usize> = (0..pubs).filter(|i| i % threads == t).collect();
+            let ids: Vec<usize> = (0..pubs).filter(|i| i % writers_n == t).collect();
             let (stop, measuring, start, sent) = (stop.clone(), measuring.clone(), start.clone(), sent.clone());
             thread::spawn(move || {
                 let mut clients: Vec<(Client, String)> =
                     ids.iter().map(|i| (connect_retry(addr, &format!("bench-pub-{i}")), format!("bench/{i}"))).collect();
-                let per_thread = rate / threads as f64;
+                let per_thread = rate / writers_n as f64;
                 let mut payload = vec![0u8; payload_len];
                 let mut rng = 0x9e37_79b9_7f4a_7c15u64 ^ t as u64;
                 let mut next = 0usize;

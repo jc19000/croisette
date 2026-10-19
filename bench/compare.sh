@@ -22,7 +22,7 @@ run() { # broker-name, bench args...
   ${BROKERS[$name]} 2>/dev/null & local pid=$!
   sleep 0.5
   local line
-  line=$(timeout 60 taskset -c 0,3 $BENCH "$@" --port 18832 --broker-pid "$pid" 2>&1 | tail -1)
+  line=$(timeout 40 taskset -c 0,3 $BENCH "$@" --port 18832 --broker-pid "$pid" 2>&1 | tail -1)
   kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
   echo "$name | $line" | tee -a "$OUT"
   sleep 0.5
@@ -34,7 +34,7 @@ for b in $ORDER; do
     run "$b" flow --pubs 10 --subs 1 --rate $r --secs 4 --warmup 1
   done
   # Fan-out: 1 publisher on bench/0, 50 subscribers: deliveries = 50 x rate.
-  for r in 1000 4000 10000 20000 40000; do
+  for r in 1000 2000 4000 10000 20000 40000; do
     run "$b" flow --pubs 1 --subs 50 --filter bench/0 --rate $r --secs 4 --warmup 1 --threads 2
   done
   # Idle connections: memory per connection, CPU while nothing happens.
