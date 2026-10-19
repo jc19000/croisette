@@ -1,6 +1,6 @@
 # cannes-mqtt: an MQTT broker PoC on cannes
 
-A proof of concept: an MQTT 3.1.1 broker built on the [cannes](../README.md) thread-per-core
+A proof of concept: an MQTT 3.1.1 broker built on the [cannes](https://github.com/jc19000/cannes) thread-per-core
 actor engine, with io_uring for the network, benchmarked against Mosquitto 2.0.18 on the same
 machine and the same load.
 
