@@ -187,13 +187,39 @@ const ACCEPT: u64 = 0;
 const RECV: u64 = 1;
 const SEND: u64 = 2;
 const CLOSE: u64 = 3;
+const TIMER: u64 = 4;
+
+/// Period of the connection tier's sweep (keep-alive and CONNECT timeouts).
+const TICK: Duration = Duration::from_secs(1);
 
 fn token(kind: u64, conn: u64) -> u64 {
     kind << 56 | conn
 }
 
+struct OwnedWill {
+    topic: Box<str>,
+    payload: Vec<u8>,
+    retain: bool,
+}
+
+/// What `handle` asks of the connection after a packet.
+enum Next {
+    Continue,
+    /// Close now.
+    Close,
+    /// Stop reading, send what is queued (a CONNACK refusing the connection), then close.
+    CloseAfterFlush,
+}
+
 struct Conn {
     fd: RawFd,
+    /// CONNECT accepted.
+    connected: bool,
+    keep_alive: u16,
+    /// Tick of the last bytes received (or of the accept before that).
+    last_rx: u32,
+    will: Option<OwnedWill>,
+    close_after_flush: bool,
     /// Bytes waiting to be sent. (The receive buffer is always owned by the recv in flight.)
     out: Vec<u8>,
     sending: bool,
@@ -205,6 +231,9 @@ struct Conn {
 pub struct Connections {
     topology: Arc<Topology>,
     listener: RawFd,
+    timer: RawFd,
+    tick: u32,
+    connect_timeout: u32,
     router: Option<ActorRef<Router>>,
     conns: Vec<Option<Conn>>,
     generations: Vec<u32>,
@@ -255,13 +284,25 @@ impl Connections {
             self.generations.push(0);
             self.conns.len() as u32 - 1
         });
-        self.conns[index as usize] =
-            Some(Conn { fd, out: Vec::new(), sending: false, dirty: false, filters: Vec::new(), client_id: None });
+        self.conns[index as usize] = Some(Conn {
+            fd,
+            connected: false,
+            keep_alive: 0,
+            last_rx: self.tick,
+            will: None,
+            close_after_flush: false,
+            out: Vec::new(),
+            sending: false,
+            dirty: false,
+            filters: Vec::new(),
+            client_id: None,
+        });
         self.open += 1;
         let id = self.id(index);
         ctx.io().unwrap().recv(fd, Vec::with_capacity(RECV_BUF), token(RECV, id));
     }
 
+    /// Closes connection `id`, publishing its will if it still has one (DISCONNECT clears it).
     fn close(&mut self, ctx: &mut Context, id: u64) {
         let index = (id & 0xffff_ffff) as usize;
         let Some(conn) = self.get(id).map(|_| ()).and_then(|_| self.conns[index].take()) else { return };
@@ -276,6 +317,16 @@ impl Connections {
                     ctx.send(actor(core, ROUTER), SubRemove { filter: filter.clone(), sub });
                 }
             }
+        }
+        if let Some(will) = conn.will {
+            if will.retain {
+                let partition = self.topology.partition(&will.topic);
+                ctx.send(
+                    actor(partition, CONTEXT),
+                    Retain { topic: will.topic.clone(), payload: will.payload.clone() },
+                );
+            }
+            self.publish(ctx, &will.topic, &will.payload);
         }
         if let Some(client_id) = conn.client_id {
             let partition = self.topology.partition(&client_id);
@@ -295,9 +346,18 @@ impl Connections {
             match codec::parse(&buf[consumed..]) {
                 Ok(Some((packet, len))) => {
                     consumed += len;
-                    if !self.handle(ctx, id, packet) {
-                        self.close(ctx, id);
-                        return;
+                    match self.handle(ctx, id, packet) {
+                        Next::Continue => {}
+                        Next::Close => {
+                            self.close(ctx, id);
+                            return;
+                        }
+                        Next::CloseAfterFlush => {
+                            // No more reads; `sent` closes once the output is out.
+                            self.get(id).unwrap().close_after_flush = true;
+                            self.mark_dirty(ctx, id);
+                            return;
+                        }
                     }
                 }
                 Ok(None) => break,
@@ -311,18 +371,61 @@ impl Connections {
         if buf.capacity() - buf.len() < RECV_BUF / 2 {
             buf.reserve(RECV_BUF);
         }
+        let tick = self.tick;
         let Some(conn) = self.get(id) else { return };
+        conn.last_rx = tick;
         let fd = conn.fd;
         ctx.io().unwrap().recv(fd, buf, token(RECV, id));
     }
 
-    /// Handles one packet from connection `id`; `false` closes the connection.
-    fn handle(&mut self, ctx: &mut Context, id: u64, packet: Packet<'_>) -> bool {
+    /// Once per `TICK`: closes connections silent for 1.5 keep-alive periods, and connections
+    /// that did not send CONNECT in time.
+    fn sweep(&mut self, ctx: &mut Context) {
+        self.tick += 1;
+        let tick = self.tick;
+        let connect_timeout = self.connect_timeout;
+        let expired: Vec<u64> = (0..self.conns.len() as u32)
+            .filter(|&i| {
+                let Some(c) = &self.conns[i as usize] else { return false };
+                let limit = match (c.connected, c.keep_alive) {
+                    (true, 0) => return false,
+                    (true, ka) => (ka as u32 * 3).div_ceil(2),
+                    (false, _) => connect_timeout,
+                };
+                tick.wrapping_sub(c.last_rx) > limit
+            })
+            .map(|i| self.id(i))
+            .collect();
+        for id in expired {
+            self.close(ctx, id);
+        }
+    }
+
+    /// Handles one packet from connection `id`.
+    fn handle(&mut self, ctx: &mut Context, id: u64, packet: Packet<'_>) -> Next {
         let core = self.core(ctx);
+        let conn = self.get(id).unwrap();
+        if conn.connected == matches!(packet, Packet::Connect(_)) {
+            return Next::Close; // anything before CONNECT, or a second CONNECT
+        }
         match packet {
-            Packet::Connect { client_id, .. } => {
-                let conn = self.get(id).unwrap();
-                codec::connack(&mut conn.out, false, 0);
+            Packet::Connect(c) => {
+                let code = if c.level != 4 && c.level != 3 {
+                    1 // unacceptable protocol version
+                } else if c.client_id.is_empty() && !c.clean_session {
+                    2 // identifier rejected
+                } else {
+                    0
+                };
+                codec::connack(&mut conn.out, false, code);
+                if code != 0 {
+                    return Next::CloseAfterFlush;
+                }
+                conn.connected = true;
+                conn.keep_alive = c.keep_alive;
+                conn.will =
+                    c.will.map(|w| OwnedWill { topic: w.topic.into(), payload: w.payload.to_vec(), retain: w.retain });
+                let client_id = c.client_id;
                 if !client_id.is_empty() {
                     conn.client_id = Some(client_id.into());
                     let partition = self.topology.partition(client_id);
@@ -340,7 +443,7 @@ impl Connections {
                     codec::puback(&mut self.get(id).unwrap().out, packet_id.unwrap_or(0));
                     self.mark_dirty(ctx, id);
                 } else if qos == 2 {
-                    return false; // not supported by the PoC
+                    return Next::Close; // not supported yet
                 }
             }
             Packet::Subscribe { packet_id, filters } => {
@@ -380,10 +483,13 @@ impl Connections {
                 self.mark_dirty(ctx, id);
             }
             Packet::PubAck { .. } => {}
-            Packet::Disconnect => return false,
-            _ => return false,
+            Packet::Disconnect => {
+                self.get(id).unwrap().will = None; // a clean disconnect discards the will
+                return Next::Close;
+            }
+            _ => return Next::Close,
         }
-        true
+        Next::Continue
     }
 
     /// Routes a message: synchronous match on this core's router replica, local delivery, one
@@ -437,6 +543,10 @@ impl Connections {
         }
         conn.sending = false;
         if conn.out.is_empty() {
+            if conn.close_after_flush {
+                self.close(ctx, id);
+                return;
+            }
             conn.out = buf; // keep the capacity
         } else {
             let next = std::mem::replace(&mut conn.out, buf);
@@ -453,7 +563,9 @@ impl Actor for Connections {
         ctx.register_handler::<Kick, Self>();
         let router = actor(ctx.core(), ROUTER);
         self.router = Some(ctx.reference_local_actor::<Router>(router).expect("router on this core"));
-        ctx.io().expect("io_uring on broker cores").accept(self.listener, token(ACCEPT, 0));
+        let mut io = ctx.io().expect("io_uring on broker cores");
+        io.accept(self.listener, token(ACCEPT, 0));
+        io.read(self.timer, Vec::with_capacity(8), 0, token(TIMER, 0));
     }
 
     /// End of the loop iteration: one send per connection with pending output.
@@ -479,6 +591,9 @@ impl Actor for Connections {
         let ids: Vec<u64> =
             (0..self.conns.len() as u32).filter(|&i| self.conns[i as usize].is_some()).map(|i| self.id(i)).collect();
         for id in ids {
+            if let Some(c) = self.get(id) {
+                c.will = None; // broker shutdown, not a client failure
+            }
             self.close(ctx, id);
         }
         true
@@ -495,6 +610,14 @@ impl Handler<IoCompletion> for Connections {
                     self.accept(ctx, c.result);
                 }
                 ctx.io().unwrap().accept(self.listener, token(ACCEPT, 0));
+            }
+            TIMER => {
+                self.sweep(ctx);
+                let timer = self.timer;
+                let mut buf = c.take_buf().unwrap_or_default();
+                buf.clear();
+                buf.reserve(8);
+                ctx.io().unwrap().read(timer, buf, 0, token(TIMER, 0));
             }
             // Completions of a connection closed meanwhile are dropped, with their buffer.
             RECV if self.get(id).is_some() => self.received(ctx, id, c.result, c.take_buf().unwrap()),
@@ -528,11 +651,19 @@ pub struct Config {
     pub port: u16,
     pub cores: Vec<CoreId>,
     pub mode: CoreMode,
+    /// A connection that has not sent CONNECT after this long is closed.
+    pub connect_timeout: Duration,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Config { ip: Ipv4Addr::UNSPECIFIED, port: 1883, cores: vec![0], mode: CoreMode::Spin }
+        Config {
+            ip: Ipv4Addr::UNSPECIFIED,
+            port: 1883,
+            cores: vec![0],
+            mode: CoreMode::Spin,
+            connect_timeout: Duration::from_secs(10),
+        }
     }
 }
 
@@ -543,6 +674,8 @@ pub fn start(config: &Config) -> std::io::Result<Engine> {
     let mut seq = StartSequence::new();
     for &core in &config.cores {
         let listener = net::reuseport_listener(config.ip, config.port, 4096)?;
+        let timer = net::timerfd(TICK)?;
+        let connect_timeout = config.connect_timeout.as_secs().max(1) as u32;
         seq.core_mode(core, config.mode);
         seq.io_uring(core, 4096);
         // Added in this order on every core, so that their ids are known up front.
@@ -552,6 +685,9 @@ pub fn start(config: &Config) -> std::io::Result<Engine> {
         let n = seq.add_actor(core, move || Connections {
             topology: t,
             listener,
+            timer,
+            tick: 0,
+            connect_timeout,
             router: None,
             conns: Vec::new(),
             generations: Vec::new(),

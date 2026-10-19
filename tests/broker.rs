@@ -1,12 +1,14 @@
 //! End-to-end tests of the broker on two cores, with real TCP clients.
 
-use std::net::{Ipv4Addr, SocketAddr, TcpListener};
+use std::io::{Read, Write};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::{Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cannes::CoreMode;
 use croisette::broker::{self, Config};
 use croisette::client::{Client, Incoming};
+use croisette::codec::{self, Connect, Will};
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
@@ -20,7 +22,8 @@ fn free_port() -> u16 {
 
 fn start(cores: Vec<usize>) -> (cannes::Engine, SocketAddr) {
     let port = free_port();
-    let config = Config { ip: Ipv4Addr::LOCALHOST, port, cores, mode: CoreMode::Spin };
+    let config =
+        Config { ip: Ipv4Addr::LOCALHOST, port, cores, mode: CoreMode::Spin, connect_timeout: Duration::from_secs(1) };
     let engine = broker::start(&config).unwrap();
     (engine, SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
 }
@@ -157,5 +160,108 @@ fn many_messages_keep_their_order() {
             .unwrap();
         }
     }
+    engine.shutdown();
+}
+
+// ---- CONNECT, will, keep-alive ------------------------------------------------------------------
+
+fn with_will<'a>(id: &'a str, topic: &'a str, retain: bool, keep_alive: u16) -> Connect<'a> {
+    Connect {
+        level: 4,
+        client_id: id,
+        keep_alive,
+        clean_session: true,
+        will: Some(Will { topic, payload: b"gone", qos: 0, retain }),
+        ..Connect::default()
+    }
+}
+
+fn assert_closed_by_broker(stream: &mut TcpStream, within: Duration) {
+    stream.set_read_timeout(Some(within)).unwrap();
+    let mut b = [0u8; 64];
+    loop {
+        match stream.read(&mut b) {
+            Ok(0) => return,
+            Ok(_) => continue, // e.g. a CONNACK before the close
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => return,
+            Err(e) => panic!("connection still open: {e}"),
+        }
+    }
+}
+
+#[test]
+fn will_is_published_on_abrupt_close_only() {
+    let _g = serial();
+    let (engine, addr) = start(vec![1, 2]);
+    let mut watcher = client(addr, "watcher");
+    watcher.subscribe(&["status/#"]).unwrap();
+    let (dev, _) = Client::connect_with(addr, &with_will("dev1", "status/dev1", false, 60)).unwrap();
+    drop(dev); // no DISCONNECT
+    assert_eq!(watcher.next_publish().unwrap(), publish_msg("status/dev1", b"gone"));
+    let (dev, _) = Client::connect_with(addr, &with_will("dev2", "status/dev2", false, 60)).unwrap();
+    dev.disconnect().unwrap();
+    watcher.set_timeout(Some(Duration::from_millis(300))).unwrap();
+    assert!(watcher.next_publish().is_err(), "no will after DISCONNECT");
+    // A retained will stays for later subscribers.
+    let (dev, _) = Client::connect_with(addr, &with_will("dev3", "status/dev3", true, 60)).unwrap();
+    drop(dev);
+    std::thread::sleep(Duration::from_millis(100));
+    let mut late = client(addr, "late");
+    late.subscribe(&["status/dev3"]).unwrap();
+    assert_eq!(
+        late.next_publish().unwrap(),
+        Incoming::Publish { topic: "status/dev3".into(), payload: b"gone".to_vec(), retain: true }
+    );
+    engine.shutdown();
+}
+
+#[test]
+fn keep_alive_expiry_closes_and_publishes_the_will() {
+    let _g = serial();
+    let (engine, addr) = start(vec![1, 2]);
+    let mut watcher = client(addr, "watcher");
+    watcher.subscribe(&["status/#"]).unwrap();
+    let (mut silent, _) = Client::connect_with(addr, &with_will("silent", "status/silent", false, 1)).unwrap();
+    let (mut pinger, _) = Client::connect_with(addr, &with_will("pinger", "status/pinger", false, 1)).unwrap();
+    let t = Instant::now();
+    // The pinger stays alive; the silent client is closed after 1.5 s (rounded up to the tick).
+    for _ in 0..8 {
+        pinger.ping().unwrap();
+        std::thread::sleep(Duration::from_millis(400));
+    }
+    assert_eq!(watcher.next_publish().unwrap(), publish_msg("status/silent", b"gone"));
+    assert_closed_by_broker(&mut silent.stream, Duration::from_secs(1));
+    assert!(t.elapsed() >= Duration::from_millis(1500));
+    pinger.ping().unwrap();
+    engine.shutdown();
+}
+
+#[test]
+fn connect_is_validated() {
+    let _g = serial();
+    let (engine, addr) = start(vec![1, 2]);
+    let refused = |c: &Connect<'_>| Client::connect_with(addr, c).err().map(|e| (e.kind(), e.to_string()));
+    let bad_level = Connect { level: 5, client_id: "x", clean_session: true, ..Connect::default() };
+    assert_eq!(refused(&bad_level), Some((std::io::ErrorKind::ConnectionRefused, "CONNACK code 1".into())));
+    let no_id = Connect { level: 4, client_id: "", clean_session: false, ..Connect::default() };
+    assert_eq!(refused(&no_id), Some((std::io::ErrorKind::ConnectionRefused, "CONNACK code 2".into())));
+    // An empty client id with a clean session is accepted.
+    let anonymous = Connect { level: 4, client_id: "", clean_session: true, ..Connect::default() };
+    assert!(refused(&anonymous).is_none());
+    // A packet before CONNECT closes the connection.
+    let mut raw = TcpStream::connect(addr).unwrap();
+    let mut b = Vec::new();
+    codec::pingreq(&mut b);
+    raw.write_all(&b).unwrap();
+    assert_closed_by_broker(&mut raw, Duration::from_secs(2));
+    // So does a second CONNECT.
+    let mut c = client(addr, "twice");
+    let mut b = Vec::new();
+    codec::connect(&mut b, "twice", 60, true);
+    c.stream.write_all(&b).unwrap();
+    assert_closed_by_broker(&mut c.stream, Duration::from_secs(2));
+    // And no CONNECT at all, after the connect timeout (1 s in the tests).
+    let mut idle = TcpStream::connect(addr).unwrap();
+    assert_closed_by_broker(&mut idle, Duration::from_secs(4));
     engine.shutdown();
 }

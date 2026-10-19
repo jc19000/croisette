@@ -1,8 +1,10 @@
-//! The few socket calls std does not offer: SO_REUSEPORT listeners and TCP_NODELAY on raw fds.
+//! The few system calls std does not offer: SO_REUSEPORT listeners, TCP_NODELAY and shutdown
+//! on raw fds, timerfd.
 
 use std::io;
 use std::net::Ipv4Addr;
 use std::os::fd::RawFd;
+use std::time::Duration;
 
 #[repr(C)]
 struct SockAddrIn {
@@ -12,12 +14,26 @@ struct SockAddrIn {
     zero: [u8; 8],
 }
 
+#[repr(C)]
+struct TimeSpec {
+    sec: i64,
+    nsec: i64,
+}
+
+#[repr(C)]
+struct ITimerSpec {
+    interval: TimeSpec,
+    value: TimeSpec,
+}
+
 extern "C" {
     fn socket(domain: i32, ty: i32, protocol: i32) -> i32;
     fn setsockopt(fd: i32, level: i32, name: i32, value: *const i32, len: u32) -> i32;
     fn bind(fd: i32, addr: *const SockAddrIn, len: u32) -> i32;
     fn listen(fd: i32, backlog: i32) -> i32;
     fn close(fd: i32) -> i32;
+    fn timerfd_create(clock: i32, flags: i32) -> i32;
+    fn timerfd_settime(fd: i32, flags: i32, new: *const ITimerSpec, old: *mut ITimerSpec) -> i32;
     #[link_name = "shutdown"]
     fn shutdown_fd(fd: i32, how: i32) -> i32;
 }
@@ -72,4 +88,18 @@ pub fn reuseport_listener(ip: Ipv4Addr, port: u16, backlog: i32) -> io::Result<R
 pub fn shutdown(fd: RawFd) {
     const SHUT_RDWR: i32 = 2;
     unsafe { shutdown_fd(fd, SHUT_RDWR) };
+}
+
+/// A timerfd firing every `period`: each read of 8 bytes completes at the next expiry, so a
+/// read kept in flight on io_uring wakes the event loop periodically, even when it sleeps.
+pub fn timerfd(period: Duration) -> io::Result<RawFd> {
+    const CLOCK_MONOTONIC: i32 = 1;
+    let fd = check(unsafe { timerfd_create(CLOCK_MONOTONIC, SOCK_CLOEXEC) })?;
+    let t = || TimeSpec { sec: period.as_secs() as i64, nsec: period.subsec_nanos() as i64 };
+    let spec = ITimerSpec { interval: t(), value: t() };
+    if let Err(e) = check(unsafe { timerfd_settime(fd, 0, &spec, std::ptr::null_mut()) }) {
+        unsafe { close(fd) };
+        return Err(e);
+    }
+    Ok(fd)
 }

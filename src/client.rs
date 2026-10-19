@@ -4,7 +4,7 @@ use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
-use crate::codec::{self, Packet};
+use crate::codec::{self, Connect, Packet};
 
 pub struct Client {
     pub stream: TcpStream,
@@ -22,18 +22,48 @@ pub enum Incoming {
 }
 
 impl Client {
-    /// Connects and completes the CONNECT / CONNACK exchange.
+    /// Connects with a clean session and a 60 s keep-alive, and completes the CONNECT / CONNACK
+    /// exchange.
     pub fn connect(addr: SocketAddr, client_id: &str) -> io::Result<Client> {
+        let c = Connect { level: 4, client_id, keep_alive: 60, clean_session: true, ..Connect::default() };
+        Client::connect_with(addr, &c).map(|(client, _)| client)
+    }
+
+    /// Connects with any CONNECT packet. Returns the client and the CONNACK's session-present
+    /// flag; a refusing CONNACK is an error of kind `ConnectionRefused` naming the code.
+    pub fn connect_with(addr: SocketAddr, connect: &Connect<'_>) -> io::Result<(Client, bool)> {
         let stream = TcpStream::connect(addr)?;
         stream.set_nodelay(true)?;
-        let mut c = Client { stream, buf: vec![0; 64 * 1024], start: 0, out: Vec::new(), next_id: 1 };
-        c.buf.clear();
-        codec::connect(&mut c.out, client_id, 60, true);
+        let mut c = Client { stream, buf: Vec::with_capacity(64 * 1024), start: 0, out: Vec::new(), next_id: 1 };
+        codec::connect_with(&mut c.out, connect);
         c.flush()?;
-        match c.read_packet(|p| matches!(p, Packet::ConnAck { code: 0, .. }))? {
-            true => Ok(c),
-            false => Err(io::Error::other("connection refused")),
+        let mut ack = None;
+        c.read_packet(|p| match p {
+            Packet::ConnAck { session_present, code } => {
+                ack = Some((*session_present, *code));
+                true
+            }
+            _ => false,
+        })?;
+        match ack {
+            Some((session_present, 0)) => Ok((c, session_present)),
+            Some((_, code)) => Err(io::Error::new(io::ErrorKind::ConnectionRefused, format!("CONNACK code {code}"))),
+            None => Err(io::Error::other("expected CONNACK")),
         }
+    }
+
+    /// Sends DISCONNECT (the broker then drops the will) and closes.
+    pub fn disconnect(mut self) -> io::Result<()> {
+        codec::disconnect(&mut self.out);
+        self.flush()
+    }
+
+    /// Sends PINGREQ and waits for PINGRESP.
+    pub fn ping(&mut self) -> io::Result<()> {
+        codec::pingreq(&mut self.out);
+        self.flush()?;
+        self.read_packet(|p| matches!(p, Packet::PingResp))?;
+        Ok(())
     }
 
     pub fn set_timeout(&self, t: Option<Duration>) -> io::Result<()> {
@@ -86,7 +116,7 @@ impl Client {
 
     /// Reads packets until one satisfies `want` (returns true) or a non-matching one arrives
     /// first (returns false). PUBLISH packets read on the way are dropped.
-    fn read_packet(&mut self, want: impl Fn(&Packet<'_>) -> bool) -> io::Result<bool> {
+    fn read_packet(&mut self, mut want: impl FnMut(&Packet<'_>) -> bool) -> io::Result<bool> {
         loop {
             if let Some(found) = self.try_parse(|p| match p {
                 Packet::Publish { .. } => None,

@@ -24,7 +24,7 @@ impl std::error::Error for Error {}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Packet<'a> {
-    Connect { client_id: &'a str, keep_alive: u16, clean_session: bool },
+    Connect(Connect<'a>),
     ConnAck { session_present: bool, code: u8 },
     Publish { topic: &'a str, payload: &'a [u8], qos: u8, retain: bool, dup: bool, packet_id: Option<u16> },
     PubAck { packet_id: u16 },
@@ -35,6 +35,28 @@ pub enum Packet<'a> {
     PingReq,
     PingResp,
     Disconnect,
+}
+
+/// A CONNECT packet. `level` is 4 for MQTT 3.1.1 and 3 for MQTT 3.1 (`MQIsdp`); the broker
+/// refuses other levels with a CONNACK.
+#[derive(Debug, PartialEq, Eq, Clone, Default)]
+pub struct Connect<'a> {
+    pub level: u8,
+    pub client_id: &'a str,
+    pub keep_alive: u16,
+    pub clean_session: bool,
+    pub will: Option<Will<'a>>,
+    pub username: Option<&'a str>,
+    pub password: Option<&'a [u8]>,
+}
+
+/// The message the broker publishes when a client goes away without DISCONNECT.
+#[derive(Debug, PartialEq, Eq, Clone, Default)]
+pub struct Will<'a> {
+    pub topic: &'a str,
+    pub payload: &'a [u8],
+    pub qos: u8,
+    pub retain: bool,
 }
 
 pub const MAX_PACKET: usize = 1 << 20;
@@ -119,14 +141,55 @@ fn str_at(buf: &[u8], at: usize) -> Result<(&str, usize), Error> {
     Ok((s, at + 2 + len))
 }
 
+/// Length-prefixed binary data at `at`; returns it and the offset after it.
+fn bytes_at(buf: &[u8], at: usize) -> Result<(&[u8], usize), Error> {
+    let len = u16_at(buf, at)? as usize;
+    let bytes = buf.get(at + 2..at + 2 + len).ok_or(Error::Malformed("truncated data"))?;
+    Ok((bytes, at + 2 + len))
+}
+
 fn parse_connect(body: &[u8]) -> Result<Packet<'_>, Error> {
     let (name, at) = str_at(body, 0)?;
     check(name == "MQTT" || name == "MQIsdp", "protocol name")?;
+    let level = *body.get(at).ok_or(Error::Malformed("truncated connect"))?;
     let flags = *body.get(at + 1).ok_or(Error::Malformed("truncated connect"))?;
+    check(flags & 0x01 == 0, "connect reserved flag")?;
     let keep_alive = u16_at(body, at + 2)?;
-    let (client_id, _) = str_at(body, at + 4)?;
-    // Will, user name and password, when present, follow; the PoC accepts and ignores them.
-    Ok(Packet::Connect { client_id, keep_alive, clean_session: flags & 0x02 != 0 })
+    let (client_id, mut at) = str_at(body, at + 4)?;
+    let will = if flags & 0x04 != 0 {
+        let (topic, next) = str_at(body, at)?;
+        let (payload, next) = bytes_at(body, next)?;
+        at = next;
+        let qos = (flags >> 3) & 3;
+        check(qos < 3, "will qos")?;
+        check(!topic.is_empty() && !topic.contains(['+', '#']), "will topic")?;
+        Some(Will { topic, payload, qos, retain: flags & 0x20 != 0 })
+    } else {
+        check(flags & 0x38 == 0, "will flags without will")?;
+        None
+    };
+    let username = if flags & 0x80 != 0 {
+        let (u, next) = str_at(body, at)?;
+        at = next;
+        Some(u)
+    } else {
+        None
+    };
+    let password = if flags & 0x40 != 0 {
+        let (p, _) = bytes_at(body, at)?;
+        Some(p)
+    } else {
+        None
+    };
+    Ok(Packet::Connect(Connect {
+        level,
+        client_id,
+        keep_alive,
+        clean_session: flags & 0x02 != 0,
+        will,
+        username,
+        password,
+    }))
 }
 
 fn parse_publish(flags: u8, body: &[u8]) -> Result<Packet<'_>, Error> {
@@ -232,13 +295,46 @@ fn put_str(out: &mut Vec<u8>, s: &str) {
     out.extend_from_slice(s.as_bytes());
 }
 
+fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
+    out.extend_from_slice(&(b.len() as u16).to_be_bytes());
+    out.extend_from_slice(b);
+}
+
 pub fn connect(out: &mut Vec<u8>, client_id: &str, keep_alive: u16, clean_session: bool) {
-    put_header(out, 0x10, 10 + 2 + client_id.len());
-    put_str(out, "MQTT");
-    out.push(4); // protocol level 3.1.1
-    out.push(if clean_session { 0x02 } else { 0 });
-    out.extend_from_slice(&keep_alive.to_be_bytes());
-    put_str(out, client_id);
+    connect_with(out, &Connect { level: 4, client_id, keep_alive, clean_session, ..Connect::default() });
+}
+
+pub fn connect_with(out: &mut Vec<u8>, c: &Connect<'_>) {
+    let mut flags = (c.clean_session as u8) << 1;
+    let mut len = 10 + 2 + c.client_id.len();
+    if let Some(w) = &c.will {
+        flags |= 0x04 | (w.qos << 3) | (w.retain as u8) << 5;
+        len += 4 + w.topic.len() + w.payload.len();
+    }
+    if let Some(u) = c.username {
+        flags |= 0x80;
+        len += 2 + u.len();
+    }
+    if let Some(p) = c.password {
+        flags |= 0x40;
+        len += 2 + p.len();
+    }
+    put_header(out, 0x10, len);
+    put_str(out, if c.level == 3 { "MQIsdp" } else { "MQTT" });
+    out.push(c.level);
+    out.push(flags);
+    out.extend_from_slice(&c.keep_alive.to_be_bytes());
+    put_str(out, c.client_id);
+    if let Some(w) = &c.will {
+        put_str(out, w.topic);
+        put_bytes(out, w.payload);
+    }
+    if let Some(u) = c.username {
+        put_str(out, u);
+    }
+    if let Some(p) = c.password {
+        put_bytes(out, p);
+    }
 }
 
 pub fn connack(out: &mut Vec<u8>, session_present: bool, code: u8) {
@@ -318,7 +414,28 @@ mod tests {
     fn packets_roundtrip() {
         let mut b = Vec::new();
         connect(&mut b, "client-1", 30, true);
-        assert_eq!(roundtrip(&b), Packet::Connect { client_id: "client-1", keep_alive: 30, clean_session: true });
+        assert_eq!(
+            roundtrip(&b),
+            Packet::Connect(Connect {
+                level: 4,
+                client_id: "client-1",
+                keep_alive: 30,
+                clean_session: true,
+                ..Connect::default()
+            })
+        );
+        b.clear();
+        let full = Connect {
+            level: 4,
+            client_id: "dev",
+            keep_alive: 10,
+            clean_session: false,
+            will: Some(Will { topic: "dev/status", payload: b"offline", qos: 1, retain: true }),
+            username: Some("user"),
+            password: Some(b"secret"),
+        };
+        connect_with(&mut b, &full);
+        assert_eq!(roundtrip(&b), Packet::Connect(full));
 
         let mut b = Vec::new();
         publish(&mut b, "a/b", b"hello", 1, true, Some(7));
