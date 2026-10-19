@@ -5,10 +5,10 @@ actor engine, with io_uring for the network. It is benchmarked against Mosquitto
 same machine and the same load.
 
 **Result in one line:** with one core each, croisette sustains about **12x (fan-in), 14x
-(fan-out) and 7x (QoS 1) the message rate** of Mosquitto before saturating, and 5x to 8x over
+(fan-out) and 6x (QoS 1) the message rate** of Mosquitto before saturating, and 5x to 8x over
 TLS. At loads both brokers
-handle, croisette uses 20 to 50 % less CPU and has lower tail latency. When idle, both use about
-0.001 core. Memory per idle connection is 0.93 KB, against 0.78 KB for Mosquitto.
+handle, croisette uses 20 to 45 % less CPU and has lower tail latency. When idle, both use about
+0.001 core. Memory per idle connection is 1.0 KB, against 0.78 KB for Mosquitto.
 
 Status: MQTT 5 and 3.1.1, with TLS, WebSocket and snapshots on disk (see [Scope](#scope)). It has not been run in
 production.
@@ -205,15 +205,15 @@ rate at which `delivered = offered`.
 
 | Offered msg/s | Mosquitto delivered | CPU | p50 / p99 | croisette delivered | CPU | p50 / p99 |
 |---:|---:|---:|---|---:|---:|---|
-| 20 000 | 20 027 | 0.41 | 49 µs / 3.2 ms | 20 028 | **0.30** | 43 µs / 1.0 ms |
-| 100 000 | **79 119 (saturated)** | 0.97 | >100 ms | 100 165 | 0.79 | 54 µs / 4.3 ms |
-| 200 000 | 81 751 | 0.97 | >100 ms | 200 276 | 0.92 | 149 µs / 18 ms |
-| 500 000 | 85 551 | 0.97 | >100 ms | 500 310 | 0.96 | 183 µs / 4.2 ms |
-| 1 000 000 | 78 014 | 0.98 | >100 ms | 1 000 405 | 0.94 | 316 µs / 28 ms |
-| 2 000 000 | 91 420 | 0.99 | >100 ms | **1 973 674 (saturated)** | 0.79 | >100 ms |
+| 20 000 | 20 029 | 0.42 | 48 µs / 1.5 ms | 20 027 | **0.29** | 42 µs / 514 µs |
+| 100 000 | **80 966 (saturated)** | 0.98 | >100 ms | 100 168 | 0.73 | 39 µs / 718 µs |
+| 200 000 | 95 972 | 0.97 | >100 ms | 200 290 | 0.93 | 83 µs / 1.3 ms |
+| 500 000 | 77 677 | 0.98 | >100 ms | 500 305 | 0.94 | 189 µs / 8.2 ms |
+| 1 000 000 | 78 126 | 0.98 | >100 ms | 1 000 477 | 0.98 | 224 µs / 5.2 ms |
+| 2 000 000 | 85 148 | 1.00 | >100 ms | **1 829 783 (saturated)** | 0.77 | >100 ms |
 
-Mosquitto saturates at about 80k msg/s, which is about 12 µs of CPU per message. croisette
-sustains 1M msg/s on the same core, at under 1 µs of CPU per message.
+Mosquitto saturates at 80–95k msg/s, about 12 µs of CPU per message. croisette sustains 1M
+msg/s on the same core, at under 1 µs of CPU per message.
 
 ### Fan-out: 1 publisher on `bench/0` → 50 subscribers, QoS 0, one broker core
 
@@ -221,28 +221,28 @@ The publish rate is multiplied by 50: deliveries = 50 × publishes.
 
 | Publishes/s → deliveries/s | Mosquitto delivered | CPU | p50 / p99 | croisette delivered | CPU | p50 / p99 |
 |---:|---:|---:|---|---:|---:|---|
-| 1 000 → 51 200 | 51 136 | 0.47 | 548 µs / 4.0 ms | 51 198 | **0.26** | 427 µs / 4.4 ms |
-| 2 000 → 102 000 | 100 696 | 0.84 | 1.7 ms / 41 ms | 100 408 | 0.43 | 426 µs / 2.7 ms |
-| 4 000 → 200 000 | **147 979 (saturated)** | 0.99 | >100 ms | 199 941 | 0.67 | 452 µs / 2.8 ms |
-| 10 000 → 500 000 | 131 996 | 0.99 | >100 ms | 498 240 | 0.92 | 606 µs / 3.1 ms |
-| 20 000 → 1 000 000 | 130 874 | 0.98 | >100 ms | 1 001 278 | 0.98 | 630 µs / 3.3 ms |
-| 40 000 → 2 000 000 | 126 209 | 0.99 | >100 ms | 2 006 566 | 0.95 | 822 µs / 7.8 ms |
+| 1 000 → 51 200 | 51 198 | 0.43 | 482 µs / 3.6 ms | 51 198 | **0.26** | 434 µs / 3.3 ms |
+| 2 000 → 102 400 | 100 508 | 0.81 | 1.2 ms / 22 ms | 100 408 | 0.44 | 415 µs / 2.4 ms |
+| 4 000 → 204 800 | **135 819 (saturated)** | 0.98 | >100 ms | 199 888 | 0.64 | 426 µs / 2.7 ms |
+| 10 000 → 512 000 | 135 702 | 0.99 | >100 ms | 498 291 | 0.92 | 564 µs / 3.1 ms |
+| 20 000 → 1 024 000 | 140 679 | 0.99 | >100 ms | 1 001 408 | 0.97 | 709 µs / 3.6 ms |
+| 40 000 → 2 048 000 | 132 607 | 0.99 | >100 ms | 2 006 358 | 0.97 | 944 µs / 14 ms |
 
-- Mosquitto peaks at about 130–150k deliveries/s.
+- Mosquitto peaks at about 135–140k deliveries/s.
 - croisette delivers 2M/s on one core, at 0.5 µs of CPU per delivery.
 
 ### QoS 1 end to end: 10 publishers → 1 subscriber, every message acknowledged, one broker core
 
 | Offered msg/s | Mosquitto delivered | CPU | p50 / p99 | croisette delivered | CPU | p50 / p99 |
 |---:|---:|---:|---|---:|---:|---|
-| 10 000 | 9 964 | 0.52 | 66 µs / 1.5 ms | 9 965 | **0.41** | 51 µs / 1.3 ms |
-| 20 000 | 20 028 | 0.88 | 141 µs / 8.2 ms | 20 028 | **0.64** | 54 µs / 1.9 ms |
-| 50 000 | **26 386 (saturated)** | 0.98 | >100 ms | 50 148 | 0.88 | 269 µs / 3.6 ms |
-| 100 000 | 24 628 | 0.98 | >100 ms | 100 164 | 0.89 | 359 µs / 2.4 ms |
-| 200 000 | 27 666 | 0.99 | >100 ms | 199 833 | 0.91 | 432 µs / 23 ms |
+| 10 000 | 9 965 | 0.51 | 65 µs / 4.1 ms | 9 962 | **0.39** | 49 µs / 5.6 ms |
+| 20 000 | 20 176 | 0.83 | 98 µs / 22 ms | 20 029 | **0.67** | 65 µs / 1.9 ms |
+| 50 000 | **31 512 (saturated)** | 0.99 | >100 ms | 50 146 | 0.87 | 246 µs / 7.5 ms |
+| 100 000 | 28 317 | 0.99 | >100 ms | 100 177 | 0.90 | 389 µs / 4.6 ms |
+| 200 000 | 28 470 | 0.98 | >100 ms | 200 319 | 0.94 | 435 µs / 38 ms |
 
-Mosquitto saturates at about 26k QoS 1 msg/s. croisette sustains 200k msg/s, and at 20k msg/s
-it uses 27 % less CPU with a p99 four times lower.
+Mosquitto saturates at about 30k QoS 1 msg/s. croisette sustains 200k msg/s, and at 20k msg/s it
+uses 20 % less CPU with a p99 ten times lower.
 
 ### TLS: the same loads over TLS 1.3, QoS 0, one broker core
 
@@ -251,14 +251,14 @@ use the test certificate in `tests/data`. The load generator speaks TLS with rus
 
 | Load | Mosquitto delivered | CPU | p50 / p99 | croisette delivered | CPU | p50 / p99 |
 |---|---:|---:|---|---:|---:|---|
-| fan-in 20 000 msg/s | 20 026 | 0.52 | 62 µs / 2.5 ms | 20 029 | **0.33** | 46 µs / 1.4 ms |
-| fan-in 50 000 msg/s | 50 147 | 0.94 | 298 µs / 28 ms | 50 149 | 0.58 | 45 µs / 2.8 ms |
-| fan-in 100 000 msg/s | **59 987 (saturated)** | 0.98 | >100 ms | 100 173 | 0.83 | 64 µs / 1.4 ms |
-| fan-in 200 000 msg/s | 55 653 | 0.98 | >100 ms | 200 283 | 0.97 | 175 µs / 2.7 ms |
-| fan-in 500 000 msg/s | 61 440 | 0.97 | >100 ms | 500 295 | 0.95 | 200 µs / 7.6 ms |
-| fan-out 1 000 → 51 200/s | 51 198 | 0.58 | 775 µs / 11 ms | 51 193 | **0.31** | 495 µs / 8.9 ms |
-| fan-out 4 000 → 200 000/s | **99 008 (saturated)** | 0.98 | >100 ms | 199 867 | 0.77 | 682 µs / 3.3 ms |
-| fan-out 10 000 → 500 000/s | 92 956 | 0.99 | >100 ms | 498 109 | 0.94 | 707 µs / 3.4 ms |
+| fan-in 20 000 msg/s | 20 027 | 0.46 | 49 µs / 1.1 ms | 20 028 | **0.32** | 44 µs / 1.2 ms |
+| fan-in 50 000 msg/s | 50 160 | 0.91 | 151 µs / 41 ms | 50 148 | 0.57 | 44 µs / 2 ms |
+| fan-in 100 000 msg/s | **62 585 (saturated)** | 1.00 | >100 ms | 100 153 | 0.82 | 52 µs / 963 µs |
+| fan-in 200 000 msg/s | 64 938 | 0.97 | >100 ms | 200 281 | 0.97 | 179 µs / 3 ms |
+| fan-in 500 000 msg/s | 62 301 | 0.99 | >100 ms | 500 307 | 0.98 | 203 µs / 3 ms |
+| fan-out 1 000 → 51 200/s | 51 198 | 0.52 | 576 µs / 3.4 ms | 51 194 | **0.29** | 456 µs / 3.2 ms |
+| fan-out 4 000 → 204 800/s | 97 246 | 0.99 | >100 ms | 199 880 | 0.64 | 451 µs / 2 ms |
+| fan-out 10 000 → 512 000/s | 102 484 | 0.99 | >100 ms | 498 248 | 0.95 | 687 µs / 2.2 ms |
 
 TLS costs both brokers. The gap stays at about 8x in fan-in and 5x in fan-out, because croisette
 encrypts each connection's batch of messages as a few records per loop iteration, while Mosquitto
@@ -268,7 +268,7 @@ encrypts message by message. Raw rows are in `bench/results-tls.txt`.
 
 | | Mosquitto | croisette (default) | croisette `spin` | croisette 2 cores (default `adaptive`) |
 |---|---:|---:|---:|---:|
-| Memory per connection | **0.78 KB** | 0.93 KB | 0.93 KB | 0.95 KB |
+| Memory per connection | **0.78 KB** | 1.00 KB | 1.01 KB | 1.03 KB |
 | CPU while idle | 0.001 core | 0.001 core | 0.99 core | 0.06 core |
 
 - **Memory:** a receive buffer starts at 256 bytes. It doubles when a receive fills it, and
@@ -280,7 +280,7 @@ encrypts message by message. Raw rows are in `bench/results-tls.txt`.
 
 ### Other configurations
 
-- **`spin`:** lowest latency (fan-in at 100k msg/s: 30 µs p50, against 54 µs by default), at the
+- **`spin`:** lowest latency (fan-in at 100k msg/s: 32 µs p50, against 39 µs by default), at the
   cost of a full core even when idle.
 - **Two cores, `adaptive`:** it reaches the same totals as one core in this setup, which is the
   limit of the load generator (two client cores). This run does not measure how the broker scales
@@ -298,14 +298,14 @@ Full rows are in `bench/results.txt`.
 These rows matter for a pay-per-use cloud service. A broker core running Mosquitto saturates at
 about:
 
-- 80k msg/s in fan-in;
-- 130–150k deliveries/s in fan-out;
-- 26k msg/s with QoS 1.
+- 80–95k msg/s in fan-in;
+- 135–140k deliveries/s in fan-out;
+- about 30k msg/s with QoS 1.
 
 On the same machine, the same core running croisette handles 1M–2M msg/s, or 200k msg/s with
 QoS 1. For the same traffic, that is roughly an order of magnitude fewer broker cores, with the
 same protocol and the same clients. When idle, croisette costs no more CPU than Mosquitto and
-about 20 % more memory per connection.
+about 30 % more memory per connection.
 
 With TLS, the ratio is about 8x in fan-in and 5x in fan-out.
 
