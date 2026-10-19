@@ -1,6 +1,6 @@
 # croisette
 
-An MQTT 3.1.1 broker built on the [cannes](https://github.com/jc19000/cannes) thread-per-core
+An MQTT 5 and 3.1.1 broker built on the [cannes](https://github.com/jc19000/cannes) thread-per-core
 actor engine, with io_uring for the network. It is benchmarked against Mosquitto 2.0.18 on the
 same machine and the same load.
 
@@ -10,7 +10,7 @@ TLS. At loads both brokers
 handle, croisette uses 20 to 50 % less CPU and has lower tail latency. When idle, both use about
 0.001 core. Memory per idle connection is 0.93 KB, against 0.78 KB for Mosquitto.
 
-Status: MQTT 3.1.1 with TLS, WebSocket and snapshots on disk (see [Scope](#scope)). It has not been run in
+Status: MQTT 5 and 3.1.1, with TLS, WebSocket and snapshots on disk (see [Scope](#scope)). It has not been run in
 production.
 
 ```sh
@@ -60,7 +60,7 @@ before every replica saw it close are forwarded to its session.
 
 ## Scope
 
-**MQTT 3.1.1, implemented:**
+**MQTT 3.1.1 (and the same in MQTT 5), implemented:**
 
 - **CONNECT:**
   - validated: protocol level, flags, client id;
@@ -93,6 +93,37 @@ before every replica saw it close are forwarded to its session.
 **TLS:** a TLS listener with rustls (`--tls-cert`, `--tls-key`, `--tls-port`, default 8883),
 alongside the TCP one.
 
+**MQTT 5**, alongside MQTT 3.1.1 and 3.1 on the same listeners; messages flow between client
+versions:
+
+- **Properties:** user properties, content type, response topic, correlation data and payload
+  format are forwarded.
+- **Reason codes:**
+  - CONNACK;
+  - PUBACK, PUBREC: No matching subscribers, Not authorized;
+  - SUBACK, UNSUBACK;
+  - DISCONNECT from the broker: keep-alive timeout, session taken over, packet too large,
+    malformed packet, topic alias invalid.
+- **Sessions:** session expiry interval (also changed by DISCONNECT) and Clean Start; the broker
+  assigns client identifiers when a client sends none.
+- **Messages:** message expiry, whether the message is live, queued for an offline session, or
+  retained.
+- **Flow:**
+  - topic aliases from clients (up to 64);
+  - the client's Receive Maximum (in-flight window) and Maximum Packet Size are honoured;
+  - the broker's maximum packet size is announced.
+- **Subscription options:** No Local, Retain As Published, Retain Handling.
+- **Will:** DISCONNECT with reason 0x04 sends the will.
+
+Not implemented yet:
+
+- subscription identifiers (announced as unavailable);
+- will delay interval (the will is sent at once);
+- enhanced authentication (AUTH; CONNACK Bad authentication method);
+- topic aliases from the broker to clients;
+- request/response information;
+- server redirection.
+
 **WebSocket:** MQTT over WebSocket (`--ws-port`), and over secure WebSocket (`--wss-port`, with
 TLS). The upgrade accepts the `mqtt` subprotocol. A packet may span binary frames, and a frame
 may hold several packets.
@@ -109,14 +140,15 @@ may hold several packets.
 Messages received after the last snapshot are lost on a crash, and nothing is fsynced. This is
 Mosquitto's model (autosave_interval).
 
-**Not implemented:** MQTT 5, bridges.
+**Not implemented:** bridges, clustering across machines.
 
 **Tests:**
 
-- `tests/broker.rs`: 30 end-to-end tests with real TCP, TLS and WebSocket clients on two cores,
-  including a restart from snapshots.
+- `tests/broker.rs`: 34 end-to-end tests with real TCP, TLS and WebSocket clients, MQTT 5 and
+  3.1.1, on two cores, including a restart from snapshots.
 - Unit tests for the codec, the index and authentication.
-- `tests/interop.sh`: 16 checks with `mosquitto_pub` / `mosquitto_sub`, TLS and restart included.
+- `tests/interop.sh`: 20 checks with `mosquitto_pub` / `mosquitto_sub`, MQTT 5, TLS and restart
+  included.
 
 ### Options
 
