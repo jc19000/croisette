@@ -86,7 +86,8 @@ before every replica saw it close are forwarded to its session.
 - **Limits and backpressure:**
   - maximum packet size;
   - `max_queued` bytes per connection: past that, QoS 0 messages to a slow subscriber are
-    dropped and counted, so it neither grows the broker's memory nor slows the others.
+    dropped and counted, so it neither grows the broker's memory nor slows the others;
+  - `max_core_backlog` bytes between two cores: the same for a core slower than its senders.
 
 **Not implemented:** TLS, persistence to disk (sessions and retained messages live in memory),
 MQTT 5, bridges, WebSockets.
@@ -206,8 +207,12 @@ it uses 27 % less CPU with a p99 four times lower.
   cost of a full core even when idle.
 - **Two cores, `adaptive`:** it reaches the same totals as one core in this setup, which is the
   limit of the load generator (two client cores). This run does not measure how the broker scales
-  across cores; that needs a separate client machine. At 2M msg/s offered, the two-core run
-  collapsed to 270k msg/s delivered. That point is not explained yet.
+  across cores; that needs a separate client machine. At 2M msg/s offered, the two-core run in
+  `bench/results.txt` collapsed to 270k msg/s delivered with 470 MB of memory. The cause was
+  events queued without bound for a core slower than its senders. Since then, cores exchange
+  credits: past `max_core_backlog` (16 MiB) unacknowledged bytes toward a core, QoS 0 messages
+  to it are dropped and counted. In the same overload, memory now stays at 61 MB and most runs
+  deliver 1.2M msg/s.
 
 Full rows are in `bench/results.txt`.
 

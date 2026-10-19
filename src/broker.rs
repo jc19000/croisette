@@ -78,6 +78,17 @@ struct Deliver {
     conns: Vec<(u64, u8)>,
 }
 
+/// connection tier -> connection tier: `bytes` of `Deliver` events from the sender handled
+/// (credit flow control between cores).
+struct DeliverAck {
+    bytes: usize,
+}
+
+/// Size counted for a `Deliver` in the credit between cores.
+fn deliver_size(d: &Deliver) -> usize {
+    d.packet.len() + d.conns.len() * 9
+}
+
 struct Retain {
     topic: Box<str>,
     payload: Vec<u8>,
@@ -523,6 +534,12 @@ pub struct Connections {
     /// tick). Messages routed to them before every router saw them go are sent on to the
     /// session.
     forwards: HashMap<u64, (CoreId, u32, u32)>,
+    /// By core: `Deliver` bytes sent to it and not acknowledged yet; past `max_core_backlog`,
+    /// QoS 0 messages to that core are dropped (it is slower than its senders).
+    unacked_to: Vec<usize>,
+    /// By core: `Deliver` bytes received from it, acknowledged at the end of the iteration.
+    consumed_from: Vec<usize>,
+    max_core_backlog: usize,
     conns: Vec<Option<Conn>>,
     generations: Vec<u32>,
     free: Vec<u32>,
@@ -966,8 +983,19 @@ impl Connections {
                     self.deliver(ctx, id, &packet, q);
                 }
             } else {
-                let conns = targets[i..j].iter().map(|&((_, id), q)| (id, q)).collect();
-                ctx.send(actor(core as CoreId, CONNECTIONS), Deliver { packet: packet.clone(), conns });
+                let conns: Vec<(u64, u8)> = targets[i..j].iter().map(|&((_, id), q)| (id, q)).collect();
+                let d = Deliver { packet: packet.clone(), conns };
+                let size = deliver_size(&d);
+                let c = core as usize;
+                if self.unacked_to.len() <= c {
+                    self.unacked_to.resize(c + 1, 0);
+                }
+                if qos == 0 && self.unacked_to[c] > self.max_core_backlog {
+                    self.dropped += d.conns.len() as u64; // that core is behind: QoS 0 can go
+                } else {
+                    self.unacked_to[c] += size;
+                    ctx.send(actor(core as CoreId, CONNECTIONS), d);
+                }
             }
             i = j;
         }
@@ -1088,6 +1116,7 @@ impl Actor for Connections {
         ctx.register_handler::<Kick, Self>();
         ctx.register_handler::<Opened, Self>();
         ctx.register_handler::<Stats, Self>();
+        ctx.register_handler::<DeliverAck, Self>();
         let router = actor(ctx.core(), ROUTER);
         self.router = Some(ctx.reference_local_actor::<Router>(router).expect("router on this core"));
         let contexts = actor(ctx.core(), CONTEXT);
@@ -1114,6 +1143,12 @@ impl Actor for Connections {
         }
         self.dirty = dirty;
         self.dirty.clear();
+        for c in 0..self.consumed_from.len() {
+            let bytes = std::mem::take(&mut self.consumed_from[c]);
+            if bytes > 0 {
+                ctx.send(actor(c as CoreId, CONNECTIONS), DeliverAck { bytes });
+            }
+        }
     }
 
     fn on_destroy_request(&mut self, ctx: &mut Context) -> bool {
@@ -1157,9 +1192,28 @@ impl Handler<IoCompletion> for Connections {
 }
 
 impl Handler<Deliver> for Connections {
-    fn on_event(&mut self, ctx: &mut Context, _src: ActorId, d: &Deliver) {
+    fn on_event(&mut self, ctx: &mut Context, src: ActorId, d: &Deliver) {
         for &(id, qos) in &d.conns {
             self.deliver(ctx, id, &d.packet, qos);
+        }
+        if src.index == CONNECTIONS && src.core as CoreId != ctx.core() {
+            let c = src.core as usize;
+            if self.consumed_from.len() <= c {
+                self.consumed_from.resize(c + 1, 0);
+            }
+            self.consumed_from[c] += deliver_size(d);
+            if !self.callback_armed {
+                self.callback_armed = true;
+                ctx.register_callback();
+            }
+        }
+    }
+}
+
+impl Handler<DeliverAck> for Connections {
+    fn on_event(&mut self, _ctx: &mut Context, src: ActorId, a: &DeliverAck) {
+        if let Some(n) = self.unacked_to.get_mut(src.core as usize) {
+            *n = n.saturating_sub(a.bytes);
         }
     }
 }
@@ -1296,6 +1350,9 @@ pub struct Config {
     pub sys_interval: Duration,
     /// Credentials and ACL; `None`: anonymous access to everything.
     pub auth: Option<Arc<Auth>>,
+    /// Bytes of messages a core may have sent to another and not seen handled; past that, QoS 0
+    /// messages to that core are dropped.
+    pub max_core_backlog: usize,
 }
 
 impl Default for Config {
@@ -1311,6 +1368,7 @@ impl Default for Config {
             max_inflight: 128,
             sys_interval: Duration::from_secs(10),
             auth: None,
+            max_core_backlog: 16 << 20,
         }
     }
 }
@@ -1327,6 +1385,7 @@ pub fn start(config: &Config) -> std::io::Result<Engine> {
         let (max_packet, max_queued, max_inflight) = (config.max_packet, config.max_queued, config.max_inflight);
         let sys_interval = config.sys_interval.as_secs() as u32;
         let auth = config.auth.clone();
+        let max_core_backlog = config.max_core_backlog;
         seq.core_mode(core, config.mode);
         seq.io_uring(core, 4096);
         // Added in this order on every core, so that their ids are known up front.
@@ -1362,6 +1421,9 @@ pub fn start(config: &Config) -> std::io::Result<Engine> {
             contexts: None,
             auth: auth.clone(),
             forwards: HashMap::new(),
+            unacked_to: Vec::new(),
+            consumed_from: Vec::new(),
+            max_core_backlog,
             conns: Vec::new(),
             generations: Vec::new(),
             free: Vec::new(),
