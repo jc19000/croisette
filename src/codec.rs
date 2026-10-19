@@ -257,8 +257,15 @@ fn parse_unsubscribe(flags: u8, body: &[u8]) -> Result<Packet<'_>, Error> {
     Ok(Packet::Unsubscribe { packet_id, filters })
 }
 
-/// `+` must fill a whole level; `#` must be last and fill a whole level.
+/// `+` must fill a whole level; `#` must be last and fill a whole level. A shared subscription
+/// `$share/<group>/<filter>` needs a group name without wildcards and a valid filter.
 pub fn valid_filter(filter: &str) -> bool {
+    if let Some(rest) = filter.strip_prefix("$share/") {
+        return match rest.split_once('/') {
+            Some((group, f)) => !group.is_empty() && !group.contains(['+', '#']) && valid_filter(f),
+            None => false,
+        };
+    }
     if filter.is_empty() {
         return false;
     }

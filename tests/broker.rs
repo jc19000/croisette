@@ -764,3 +764,46 @@ fn sys_topics_report_the_totals_of_every_core() {
     assert_nothing(&mut all);
     engine.shutdown();
 }
+
+// ---- Shared subscriptions -----------------------------------------------------------------------
+
+#[test]
+fn shared_subscription_spreads_messages_over_the_group() {
+    let _g = serial();
+    let (engine, addr) = start(vec![1, 2]);
+    let mut p = client(addr, "p");
+    p.publish("jobs/old", b"retained", 0, true).unwrap();
+    let mut workers: Vec<Client> = (0..3).map(|i| client(addr, &format!("w{i}"))).collect();
+    for w in workers.iter_mut() {
+        w.subscribe_qos(&["$share/workers/jobs/#"], 1).unwrap();
+    }
+    let mut monitor = client(addr, "monitor");
+    monitor.subscribe(&["jobs/#"]).unwrap();
+    assert_eq!(
+        monitor.next_publish().unwrap(),
+        Incoming::Publish { topic: "jobs/old".into(), payload: b"retained".to_vec(), qos: 0, retain: true }
+    );
+    std::thread::sleep(Duration::from_millis(50));
+    let n = 300u32;
+    for i in 0..n {
+        p.publish("jobs/new", &i.to_be_bytes(), 1, false).unwrap();
+    }
+    for _ in 0..n {
+        monitor.next_publish().unwrap();
+    }
+    let mut seen = vec![0u32; n as usize];
+    let mut per_worker = Vec::new();
+    for w in workers.iter_mut() {
+        w.set_timeout(Some(Duration::from_millis(300))).unwrap();
+        let mut got = 0;
+        while let Ok(Incoming::Publish { payload, retain, .. }) = w.next_publish() {
+            assert!(!retain, "no retained message for a shared subscription");
+            seen[u32::from_be_bytes(payload[..4].try_into().unwrap()) as usize] += 1;
+            got += 1;
+        }
+        per_worker.push(got);
+    }
+    assert!(seen.iter().all(|&c| c == 1), "each message to exactly one worker");
+    assert!(per_worker.iter().all(|&c| c >= n / 4), "{per_worker:?}");
+    engine.shutdown();
+}

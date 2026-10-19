@@ -1,5 +1,9 @@
 //! Subscription index: a trie of topic levels with `+` and `#` branches.
+//!
+//! Shared subscriptions (`$share/<group>/<filter>`) sit where `<filter>` ends, as groups: a
+//! message matching the filter goes to one member of each group, in turn.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 
 /// A subscriber: the core owning its connection, and the connection id on that core.
@@ -8,12 +12,89 @@ pub type Sub = (u16, u64);
 /// A subscriber with the QoS granted to its subscription.
 pub type Entry = (Sub, u8);
 
+/// Splits `$share/<group>/<filter>` into the group and the filter.
+pub fn shared(filter: &str) -> Option<(&str, &str)> {
+    filter.strip_prefix("$share/")?.split_once('/')
+}
+
+#[derive(Default)]
+struct Subs {
+    plain: Vec<Entry>,
+    groups: Vec<Group>,
+}
+
+struct Group {
+    name: Box<str>,
+    members: Vec<Entry>,
+    next: Cell<usize>,
+}
+
+impl Subs {
+    fn is_empty(&self) -> bool {
+        self.plain.is_empty() && self.groups.is_empty()
+    }
+
+    /// Adds or updates `sub`; returns 1 if it was added.
+    fn put(&mut self, group: Option<&str>, sub: Sub, qos: u8) -> usize {
+        let entries = match group {
+            None => &mut self.plain,
+            Some(name) => match self.groups.iter().position(|g| &*g.name == name) {
+                Some(i) => &mut self.groups[i].members,
+                None => {
+                    self.groups.push(Group { name: name.into(), members: Vec::new(), next: Cell::new(0) });
+                    &mut self.groups.last_mut().unwrap().members
+                }
+            },
+        };
+        match entries.iter_mut().find(|e| e.0 == sub) {
+            Some(e) => {
+                e.1 = qos;
+                0
+            }
+            None => {
+                entries.push((sub, qos));
+                1
+            }
+        }
+    }
+
+    fn take(&mut self, group: Option<&str>, sub: Sub) -> bool {
+        let (entries, g) = match group {
+            None => (&mut self.plain, None),
+            Some(name) => match self.groups.iter().position(|g| &*g.name == name) {
+                Some(i) => (&mut self.groups[i].members, Some(i)),
+                None => return false,
+            },
+        };
+        let Some(at) = entries.iter().position(|s| s.0 == sub) else { return false };
+        entries.swap_remove(at);
+        if let Some(i) = g {
+            if self.groups[i].members.is_empty() {
+                self.groups.swap_remove(i);
+            }
+        }
+        true
+    }
+
+    /// Every plain subscriber, and one member of each group.
+    #[inline]
+    fn emit(&self, f: &mut impl FnMut(Sub, u8)) {
+        self.plain.iter().for_each(|&(s, q)| f(s, q));
+        for g in &self.groups {
+            let i = g.next.get() % g.members.len();
+            g.next.set(i + 1);
+            let (s, q) = g.members[i];
+            f(s, q);
+        }
+    }
+}
+
 #[derive(Default)]
 struct Node {
     children: HashMap<Box<str>, Node>,
     plus: Option<Box<Node>>,
-    hash: Vec<Entry>,  // subscribers of `<path>/#`
-    exact: Vec<Entry>, // subscribers of `<path>`
+    hash: Subs,  // subscribers of `<path>/#`
+    exact: Subs, // subscribers of `<path>`
 }
 
 impl Node {
@@ -43,13 +124,17 @@ impl SubIndex {
     }
 
     /// Adds `sub` to `filter` with QoS `qos`; subscribing again to the same filter replaces the
-    /// QoS.
+    /// QoS. A `$share/<group>/<filter>` filter makes `sub` a member of the group.
     pub fn add(&mut self, filter: &str, sub: Sub, qos: u8) {
+        let (group, filter) = match shared(filter) {
+            Some((g, f)) => (Some(g), f),
+            None => (None, filter),
+        };
         let mut node = &mut self.root;
         let mut levels = filter.split('/').peekable();
         while let Some(level) = levels.next() {
             if level == "#" {
-                self.len += put(&mut node.hash, sub, qos);
+                self.len += node.hash.put(group, sub, qos);
                 return;
             }
             node = if level == "+" {
@@ -58,23 +143,27 @@ impl SubIndex {
                 node.children.entry(level.into()).or_default()
             };
             if levels.peek().is_none() {
-                self.len += put(&mut node.exact, sub, qos);
+                self.len += node.exact.put(group, sub, qos);
             }
         }
     }
 
     /// Removes `sub` from `filter`; returns whether it was there.
     pub fn remove(&mut self, filter: &str, sub: Sub) -> bool {
+        let (group, filter) = match shared(filter) {
+            Some((g, f)) => (Some(g), f),
+            None => (None, filter),
+        };
         let levels: Vec<&str> = filter.split('/').collect();
-        let removed = remove_at(&mut self.root, &levels, sub);
+        let removed = remove_at(&mut self.root, &levels, group, sub);
         if removed {
             self.len -= 1;
         }
         removed
     }
 
-    /// Calls `f` for every subscriber whose filter matches `topic` (once per matching filter),
-    /// with the QoS of that subscription.
+    /// Calls `f` for every subscriber whose filter matches `topic` (once per matching filter, and
+    /// for one member of each matching group), with the QoS of that subscription.
     pub fn for_each_match(&self, topic: &str, mut f: impl FnMut(Sub, u8)) {
         let levels: Vec<&str> = topic.split('/').collect();
         let dollar = topic.starts_with('$');
@@ -82,21 +171,21 @@ impl SubIndex {
     }
 }
 
-fn remove_at(node: &mut Node, levels: &[&str], sub: Sub) -> bool {
+fn remove_at(node: &mut Node, levels: &[&str], group: Option<&str>, sub: Sub) -> bool {
     let Some((&level, rest)) = levels.split_first() else { return false };
     if level == "#" {
-        return take(&mut node.hash, sub);
+        return node.hash.take(group, sub);
     }
     let removed = if level == "+" {
         let Some(child) = node.plus.as_mut() else { return false };
-        let removed = if rest.is_empty() { take(&mut child.exact, sub) } else { remove_at(child, rest, sub) };
+        let removed = if rest.is_empty() { child.exact.take(group, sub) } else { remove_at(child, rest, group, sub) };
         if child.is_empty() {
             node.plus = None;
         }
         removed
     } else {
         let Some(child) = node.children.get_mut(level) else { return false };
-        let removed = if rest.is_empty() { take(&mut child.exact, sub) } else { remove_at(child, rest, sub) };
+        let removed = if rest.is_empty() { child.exact.take(group, sub) } else { remove_at(child, rest, group, sub) };
         if child.is_empty() {
             node.children.remove(level);
         }
@@ -105,44 +194,20 @@ fn remove_at(node: &mut Node, levels: &[&str], sub: Sub) -> bool {
     removed
 }
 
-/// Adds or updates `sub`; returns 1 if it was added.
-fn put(entries: &mut Vec<Entry>, sub: Sub, qos: u8) -> usize {
-    match entries.iter_mut().find(|e| e.0 == sub) {
-        Some(e) => {
-            e.1 = qos;
-            0
-        }
-        None => {
-            entries.push((sub, qos));
-            1
-        }
-    }
-}
-
-fn take(subs: &mut Vec<Entry>, sub: Sub) -> bool {
-    match subs.iter().position(|s| s.0 == sub) {
-        Some(i) => {
-            subs.swap_remove(i);
-            true
-        }
-        None => false,
-    }
-}
-
 fn visit(node: &Node, levels: &[&str], root: bool, dollar: bool, f: &mut impl FnMut(Sub, u8)) {
     // `#` and `+` at the first level never match topics starting with `$`.
     let wildcards = !(root && dollar);
     if wildcards {
-        node.hash.iter().for_each(|&(s, q)| f(s, q));
+        node.hash.emit(f);
     }
     let Some((&level, rest)) = levels.split_first() else {
-        node.exact.iter().for_each(|&(s, q)| f(s, q));
+        node.exact.emit(f);
         return;
     };
     if let Some(child) = node.children.get(level) {
         if rest.is_empty() {
-            child.exact.iter().for_each(|&(s, q)| f(s, q));
-            child.hash.iter().for_each(|&(s, q)| f(s, q)); // `a/#` matches `a`
+            child.exact.emit(f);
+            child.hash.emit(f); // `a/#` matches `a`
         } else {
             visit(child, rest, false, dollar, f);
         }
@@ -150,8 +215,8 @@ fn visit(node: &Node, levels: &[&str], root: bool, dollar: bool, f: &mut impl Fn
     if wildcards {
         if let Some(child) = node.plus.as_deref() {
             if rest.is_empty() {
-                child.exact.iter().for_each(|&(s, q)| f(s, q));
-                child.hash.iter().for_each(|&(s, q)| f(s, q));
+                child.exact.emit(f);
+                child.hash.emit(f);
             } else {
                 visit(child, rest, false, dollar, f);
             }
@@ -203,5 +268,33 @@ mod tests {
         assert!(index.remove("a/#", (2, 9)));
         assert!(index.is_empty());
         assert!(index.root.is_empty(), "empty branches are pruned");
+    }
+
+    #[test]
+    fn shared_groups_take_turns() {
+        let mut index = SubIndex::new();
+        index.add("$share/g/a/+", (0, 1), 0);
+        index.add("$share/g/a/+", (0, 2), 0);
+        index.add("$share/h/a/#", (0, 3), 0);
+        index.add("a/b", (0, 4), 0);
+        let mut got = Vec::new();
+        for _ in 0..4 {
+            got.push(matched(&index, "a/b"));
+        }
+        assert_eq!(
+            got,
+            vec![
+                vec![(0, 1), (0, 3), (0, 4)],
+                vec![(0, 2), (0, 3), (0, 4)],
+                vec![(0, 1), (0, 3), (0, 4)],
+                vec![(0, 2), (0, 3), (0, 4)]
+            ]
+        );
+        assert!(index.remove("$share/g/a/+", (0, 1)));
+        assert_eq!(matched(&index, "a/b"), vec![(0, 2), (0, 3), (0, 4)]);
+        assert!(index.remove("$share/g/a/+", (0, 2)));
+        assert!(index.remove("$share/h/a/#", (0, 3)));
+        assert!(index.remove("a/b", (0, 4)));
+        assert!(index.is_empty() && index.root.is_empty());
     }
 }

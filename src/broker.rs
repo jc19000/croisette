@@ -823,8 +823,11 @@ impl Connections {
                 let granted: Vec<u8> = filters.iter().map(|(_, q)| (*q).min(2)).collect();
                 for (&(filter, _), &qos) in filters.iter().zip(&granted) {
                     self.add_sub(ctx, filter, sub, qos);
-                    for &other in &self.topology.cores {
-                        ctx.send(actor(other, CONTEXT), RetainedQuery { filter: filter.into(), conn: id, qos });
+                    if crate::index::shared(filter).is_none() {
+                        // Retained messages are not sent for shared subscriptions.
+                        for &other in &self.topology.cores {
+                            ctx.send(actor(other, CONTEXT), RetainedQuery { filter: filter.into(), conn: id, qos });
+                        }
                     }
                 }
                 let conn = self.get(id).unwrap();
