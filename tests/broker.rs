@@ -988,3 +988,148 @@ fn retained_and_sessions_survive_a_restart() {
     assert_eq!(names, vec!["partition-1.db".to_string()], "the old partition is gone");
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+// ---- WebSocket ----------------------------------------------------------------------------------
+
+/// A minimal MQTT-over-WebSocket client on any stream (TCP or TLS).
+struct WsClient<S: Read + Write> {
+    s: S,
+    frames: Vec<u8>, // bytes of server frames not decoded yet
+    mqtt: Vec<u8>,   // MQTT bytes from the frames
+}
+
+impl<S: Read + Write> WsClient<S> {
+    fn new(mut s: S) -> Self {
+        let req = "GET /mqtt HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: mqtt\r\n\r\n";
+        s.write_all(req.as_bytes()).unwrap();
+        let mut c = WsClient { s, frames: Vec::new(), mqtt: Vec::new() };
+        while !c.frames.windows(4).any(|w| w == b"\r\n\r\n") {
+            c.read_more();
+        }
+        let end = c.frames.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        let response = String::from_utf8_lossy(&c.frames[..end]).to_string();
+        assert!(response.starts_with("HTTP/1.1 101"), "{response}");
+        assert!(response.contains("Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo="));
+        c.frames.drain(..end);
+        c
+    }
+
+    fn read_more(&mut self) {
+        let mut chunk = [0u8; 65536];
+        let n = self.s.read(&mut chunk).unwrap();
+        assert!(n > 0, "closed");
+        self.frames.extend_from_slice(&chunk[..n]);
+    }
+
+    fn send(&mut self, mqtt: &[u8]) {
+        let mask = [9u8, 8, 7, 6];
+        let mut f = vec![0x82];
+        match mqtt.len() {
+            n if n < 126 => f.push(0x80 | n as u8),
+            n if n <= 0xffff => {
+                f.push(0x80 | 126);
+                f.extend_from_slice(&(n as u16).to_be_bytes());
+            }
+            n => {
+                f.push(0x80 | 127);
+                f.extend_from_slice(&(n as u64).to_be_bytes());
+            }
+        }
+        f.extend_from_slice(&mask);
+        f.extend(mqtt.iter().enumerate().map(|(i, x)| x ^ mask[i % 4]));
+        self.s.write_all(&f).unwrap();
+    }
+
+    fn next_publish(&mut self) -> (String, Vec<u8>) {
+        loop {
+            if let Some((p, len)) = codec::parse(&self.mqtt).unwrap() {
+                let got = match p {
+                    codec::Packet::Publish { topic, payload, .. } => Some((topic.to_string(), payload.to_vec())),
+                    _ => None,
+                };
+                self.mqtt.drain(..len);
+                if let Some(g) = got {
+                    return g;
+                }
+                continue;
+            }
+            // Decode one server frame (unmasked), or read more.
+            let b = &self.frames;
+            let header = if b.len() >= 2 {
+                match b[1] & 0x7f {
+                    126 if b.len() >= 4 => Some((u16::from_be_bytes([b[2], b[3]]) as usize, 4)),
+                    127 if b.len() >= 10 => Some((u64::from_be_bytes(b[2..10].try_into().unwrap()) as usize, 10)),
+                    126 | 127 => None,
+                    n => Some((n as usize, 2)),
+                }
+            } else {
+                None
+            };
+            match header {
+                Some((len, at)) if self.frames.len() >= at + len => {
+                    assert_eq!(self.frames[0] & 0x0f, 2, "binary frame");
+                    let payload: Vec<u8> = self.frames[at..at + len].to_vec();
+                    self.frames.drain(..at + len);
+                    self.mqtt.extend_from_slice(&payload);
+                }
+                _ => self.read_more(),
+            }
+        }
+    }
+}
+
+#[test]
+fn websocket_and_secure_websocket_clients() {
+    let _g = serial();
+    let tls = croisette::tls::server_config_from_pem(include_bytes!("data/cert.pem"), include_bytes!("data/key.pem"))
+        .unwrap();
+    let (ws_port, wss_port) = (free_port(), free_port());
+    let config = Config {
+        cores: vec![1, 2],
+        tls: Some(tls),
+        tls_port: free_port(),
+        ws_port: Some(ws_port),
+        wss_port: Some(wss_port),
+        ..Config::default()
+    };
+    let (engine, addr) = start_with(config);
+    let tcp = TcpStream::connect((Ipv4Addr::LOCALHOST, ws_port)).unwrap();
+    tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut ws = WsClient::new(tcp);
+    let mut wss = WsClient::new(tls_connect(SocketAddr::from((Ipv4Addr::LOCALHOST, wss_port))));
+    for (c, id) in [(&mut ws as &mut dyn WsSend, "ws"), (&mut wss as &mut dyn WsSend, "wss")] {
+        let mut b = Vec::new();
+        codec::connect(&mut b, id, 60, true);
+        codec::subscribe(&mut b, 1, &[("web/#", 0)]);
+        c.send_mqtt(&b);
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    let mut p = client(addr, "p");
+    let big: Vec<u8> = (0..70_000u32).map(|i| i as u8).collect(); // a 64-bit length frame
+    p.publish("web/a", b"hi", 1, false).unwrap();
+    p.publish("web/big", &big, 1, false).unwrap();
+    assert_eq!(ws.next_publish(), ("web/a".into(), b"hi".to_vec()));
+    assert_eq!(ws.next_publish(), ("web/big".into(), big.clone()));
+    assert_eq!(wss.next_publish(), ("web/a".into(), b"hi".to_vec()));
+    assert_eq!(wss.next_publish(), ("web/big".into(), big.clone()));
+    // WebSocket publisher, TCP subscriber; the packet split over two frames.
+    let mut s = client(addr, "s");
+    s.subscribe(&["from/ws"]).unwrap();
+    let mut b = Vec::new();
+    codec::publish(&mut b, "from/ws", b"split", 0, false, None);
+    let (x, y) = b.split_at(3);
+    ws.send(x);
+    ws.send(y);
+    assert_eq!(s.next_publish().unwrap(), publish_msg("from/ws", b"split"));
+    engine.shutdown();
+}
+
+trait WsSend {
+    fn send_mqtt(&mut self, b: &[u8]);
+}
+
+impl<S: Read + Write> WsSend for WsClient<S> {
+    fn send_mqtt(&mut self, b: &[u8]) {
+        self.send(b)
+    }
+}

@@ -10,7 +10,7 @@ TLS. At loads both brokers
 handle, croisette uses 20 to 50 % less CPU and has lower tail latency. When idle, both use about
 0.001 core. Memory per idle connection is 0.93 KB, against 0.78 KB for Mosquitto.
 
-Status: MQTT 3.1.1 with TLS and snapshots on disk (see [Scope](#scope)). It has not been run in
+Status: MQTT 3.1.1 with TLS, WebSocket and snapshots on disk (see [Scope](#scope)). It has not been run in
 production.
 
 ```sh
@@ -93,6 +93,10 @@ before every replica saw it close are forwarded to its session.
 **TLS:** a TLS listener with rustls (`--tls-cert`, `--tls-key`, `--tls-port`, default 8883),
 alongside the TCP one.
 
+**WebSocket:** MQTT over WebSocket (`--ws-port`), and over secure WebSocket (`--wss-port`, with
+TLS). The upgrade accepts the `mqtt` subprotocol. A packet may span binary frames, and a frame
+may hold several packets.
+
 **Persistence:** `--persist-dir DIR` saves the retained messages and the persistent sessions
 (subscriptions and undelivered QoS 1/2 messages):
 
@@ -105,12 +109,12 @@ alongside the TCP one.
 Messages received after the last snapshot are lost on a crash, and nothing is fsynced. This is
 Mosquitto's model (autosave_interval).
 
-**Not implemented:** MQTT 5, bridges, WebSockets.
+**Not implemented:** MQTT 5, bridges.
 
 **Tests:**
 
-- `tests/broker.rs`: 29 end-to-end tests with real TCP and TLS clients on two cores, including
-  a restart from snapshots.
+- `tests/broker.rs`: 30 end-to-end tests with real TCP, TLS and WebSocket clients on two cores,
+  including a restart from snapshots.
 - Unit tests for the codec, the index and authentication.
 - `tests/interop.sh`: 16 checks with `mosquitto_pub` / `mosquitto_sub`, TLS and restart included.
 
@@ -120,7 +124,8 @@ Mosquitto's model (autosave_interval).
 croisette [--port 1883] [--cores 1,2] [--mode MODE] [--max-queued BYTES] [--max-packet BYTES]
           [--max-inflight N] [--connect-timeout S] [--sys-interval S]
           [--passwd FILE] [--acl FILE] [--allow-anonymous true|false]
-          [--tls-cert PEM --tls-key PEM [--tls-port 8883]] [--persist-dir DIR [--autosave S]]
+          [--tls-cert PEM --tls-key PEM [--tls-port 8883] [--wss-port P]] [--ws-port P]
+          [--persist-dir DIR [--autosave S]]
 croisette hash-password USER PASSWORD
 ```
 

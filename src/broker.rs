@@ -32,6 +32,7 @@ use crate::index::{Entry, Sub, SubIndex};
 use crate::net;
 use crate::persist::{self, Saved, SavedSession};
 use crate::tls::{ServerConfig, Tls};
+use crate::ws::Ws;
 
 const ROUTER: u32 = 0;
 const CONTEXT: u32 = 1;
@@ -517,6 +518,8 @@ const CLOSE: u64 = 3;
 const TIMER: u64 = 4;
 const ACCEPT_TLS: u64 = 5;
 const SAVE: u64 = 6;
+const ACCEPT_WS: u64 = 7;
+const ACCEPT_WSS: u64 = 8;
 
 /// Period of the connection tier's sweep (keep-alive and CONNECT timeouts).
 const TICK: Duration = Duration::from_secs(1);
@@ -597,8 +600,11 @@ struct Conn {
     held: Option<Vec<u8>>,
     /// Access rules, when the broker has an ACL.
     rules: Option<Box<[Rule]>>,
-    /// TLS state of a connection accepted on the TLS listener: `out` then holds plaintext.
+    /// Layers under MQTT, for connections accepted on the TLS, WebSocket or secure WebSocket
+    /// listeners: received bytes go through TLS then WebSocket, and `out` (MQTT bytes) through
+    /// WebSocket then TLS when sent.
     tls: Option<Box<Tls>>,
+    ws: Option<Box<Ws>>,
     /// Bytes waiting to be sent. (The receive buffer is always owned by the recv in flight.)
     out: Vec<u8>,
     sending: bool,
@@ -609,8 +615,8 @@ struct Conn {
 
 pub struct Connections {
     topology: Arc<Topology>,
-    listener: RawFd,
-    tls_listener: Option<RawFd>,
+    /// Listening sockets, with their accept token kind (ACCEPT, ACCEPT_TLS, ACCEPT_WS, ACCEPT_WSS).
+    listeners: Vec<(u64, RawFd)>,
     tls_config: Option<Arc<ServerConfig>>,
     timer: RawFd,
     tick: u32,
@@ -691,7 +697,9 @@ impl Connections {
         }
     }
 
-    fn accept(&mut self, ctx: &mut Context, fd: RawFd, tls: bool) {
+    fn accept(&mut self, ctx: &mut Context, fd: RawFd, kind: u64) {
+        let tls = kind == ACCEPT_TLS || kind == ACCEPT_WSS;
+        let ws = (kind == ACCEPT_WS || kind == ACCEPT_WSS).then(Ws::new);
         let tls = match (tls, &self.tls_config) {
             (true, Some(config)) => match Tls::new(config) {
                 Ok(t) => Some(t),
@@ -721,6 +729,7 @@ impl Connections {
             held: None,
             rules: None,
             tls,
+            ws,
             out: Vec::new(),
             sending: false,
             dirty: false,
@@ -811,24 +820,28 @@ impl Connections {
         self.bytes_in += result as u64;
         let filled = buf.len() == buf.capacity();
         let Some(conn) = self.get(id) else { return };
-        if let Some(mut tls) = conn.tls.take() {
-            // TLS: `buf` is ciphertext, the packets are parsed from the plaintext it carries.
-            if tls.receive(&buf).is_err() {
+        if conn.tls.is_some() || conn.ws.is_some() {
+            // TLS and/or WebSocket: the packets are parsed from the bytes they carry.
+            let Ok(mut mqtt) = unwrap_layers(conn, &buf) else {
                 self.close(ctx, id);
                 return;
-            }
+            };
             buf.clear();
-            let mut plain = std::mem::take(&mut tls.plain);
-            let handshake = tls.wants_write();
-            conn.tls = Some(tls);
-            if handshake {
+            let wants_write =
+                conn.tls.as_ref().is_some_and(|t| t.wants_write()) || conn.ws.as_ref().is_some_and(|w| w.wants_write());
+            if conn.ws.as_ref().is_some_and(|w| w.closing) {
+                conn.close_after_flush = true; // WebSocket close or refused upgrade
+                self.mark_dirty(ctx, id);
+                return;
+            }
+            if wants_write {
                 self.mark_dirty(ctx, id);
             }
-            if !self.parse_all(ctx, id, &mut plain) {
+            if !self.parse_all(ctx, id, &mut mqtt) {
                 return;
             }
             let Some(conn) = self.get(id) else { return };
-            conn.tls.as_mut().unwrap().plain = plain;
+            put_back(conn, mqtt);
         } else if !self.parse_all(ctx, id, &mut buf) {
             return;
         }
@@ -905,15 +918,12 @@ impl Connections {
         }
         let Some(conn) = self.get(id) else { return };
         let fd = conn.fd;
-        let buf = match conn.tls.as_mut() {
-            Some(tls) => {
-                tls.plain = held;
-                Vec::with_capacity(RECV_MIN)
-            }
-            None => {
-                held.reserve(RECV_MIN);
-                held
-            }
+        let buf = if conn.tls.is_some() || conn.ws.is_some() {
+            put_back(conn, held);
+            Vec::with_capacity(RECV_MIN)
+        } else {
+            held.reserve(RECV_MIN);
+            held
         };
         ctx.io().unwrap().recv(fd, buf, token(RECV, id));
     }
@@ -1320,7 +1330,7 @@ impl Connections {
                     self.close(ctx, id);
                     return;
                 }
-                if conn.tls.is_none() {
+                if conn.tls.is_none() && conn.ws.is_none() {
                     conn.out = spare; // keep the capacity
                 }
             }
@@ -1328,24 +1338,65 @@ impl Connections {
     }
 }
 
-/// What connection `conn` has to send, in `spare` or in place of its output buffer (TLS:
-/// encrypted, with any handshake records); `Err(spare)` when there is nothing.
+/// What connection `conn` has to send, in `spare` or in place of its output buffer (through
+/// WebSocket and TLS, with any handshake or control records); `Err(spare)` when there is nothing.
 fn take_output(conn: &mut Conn, mut spare: Vec<u8>) -> Result<Vec<u8>, Vec<u8>> {
-    match conn.tls.as_mut() {
-        None if conn.out.is_empty() => Err(spare),
-        None => Ok(std::mem::replace(&mut conn.out, spare)),
-        Some(tls) => {
-            if conn.out.is_empty() && !tls.wants_write() {
-                return Err(spare);
-            }
-            spare.clear();
-            let sent = tls.send(&conn.out, &mut spare);
-            conn.out.clear();
-            match sent {
-                Ok(()) if !spare.is_empty() => Ok(spare),
-                _ => Err(spare),
-            }
+    if conn.tls.is_none() && conn.ws.is_none() {
+        return if conn.out.is_empty() { Err(spare) } else { Ok(std::mem::replace(&mut conn.out, spare)) };
+    }
+    let pending = !conn.out.is_empty()
+        || conn.tls.as_ref().is_some_and(|t| t.wants_write())
+        || conn.ws.as_ref().is_some_and(|w| w.wants_write());
+    if !pending {
+        return Err(spare);
+    }
+    spare.clear();
+    let sent = match (conn.ws.as_mut(), conn.tls.as_mut()) {
+        (Some(ws), Some(tls)) => {
+            let mut framed = Vec::with_capacity(conn.out.len() + 16);
+            ws.send(&conn.out, &mut framed);
+            tls.send(&framed, &mut spare)
         }
+        (Some(ws), None) => {
+            ws.send(&conn.out, &mut spare);
+            Ok(())
+        }
+        (None, Some(tls)) => tls.send(&conn.out, &mut spare),
+        (None, None) => unreachable!(),
+    };
+    conn.out.clear();
+    match sent {
+        Ok(()) if !spare.is_empty() => Ok(spare),
+        _ => Err(spare),
+    }
+}
+
+/// Received bytes through TLS then WebSocket: the MQTT bytes not parsed yet, taken out of the
+/// connection (`put_back` returns what is left). Err: the connection must close.
+fn unwrap_layers(conn: &mut Conn, data: &[u8]) -> Result<Vec<u8>, ()> {
+    let mut bytes = match conn.tls.as_mut() {
+        Some(tls) => {
+            tls.receive(data).map_err(|_| ())?;
+            std::mem::take(&mut tls.plain)
+        }
+        None => data.to_vec(),
+    };
+    if let Some(ws) = conn.ws.as_mut() {
+        ws.receive(&bytes).map_err(|_| ())?;
+        if let Some(tls) = conn.tls.as_mut() {
+            bytes.clear();
+            tls.plain = bytes; // keeps its capacity
+        }
+        return Ok(std::mem::take(&mut ws.mqtt));
+    }
+    Ok(bytes)
+}
+
+fn put_back(conn: &mut Conn, rest: Vec<u8>) {
+    if let Some(ws) = conn.ws.as_mut() {
+        ws.mqtt = rest;
+    } else if let Some(tls) = conn.tls.as_mut() {
+        tls.plain = rest;
     }
 }
 
@@ -1362,9 +1413,8 @@ impl Actor for Connections {
         let contexts = actor(ctx.core(), CONTEXT);
         self.contexts = Some(ctx.reference_local_actor::<Contexts>(contexts).expect("contexts on this core"));
         let mut io = ctx.io().expect("io_uring on broker cores");
-        io.accept(self.listener, token(ACCEPT, 0));
-        if let Some(l) = self.tls_listener {
-            io.accept(l, token(ACCEPT_TLS, 0));
+        for &(kind, fd) in &self.listeners {
+            io.accept(fd, token(kind, 0));
         }
         io.read(self.timer, Vec::with_capacity(8), 0, token(TIMER, 0));
     }
@@ -1412,18 +1462,12 @@ impl Handler<IoCompletion> for Connections {
         let kind = c.token >> 56;
         let id = c.token & 0x00ff_ffff_ffff_ffff;
         match kind {
-            ACCEPT => {
+            ACCEPT | ACCEPT_TLS | ACCEPT_WS | ACCEPT_WSS => {
                 if c.result >= 0 {
-                    self.accept(ctx, c.result, false);
+                    self.accept(ctx, c.result, kind);
                 }
-                ctx.io().unwrap().accept(self.listener, token(ACCEPT, 0));
-            }
-            ACCEPT_TLS => {
-                if c.result >= 0 {
-                    self.accept(ctx, c.result, true);
-                }
-                let l = self.tls_listener.unwrap();
-                ctx.io().unwrap().accept(l, token(ACCEPT_TLS, 0));
+                let Some(&(_, fd)) = self.listeners.iter().find(|l| l.0 == kind) else { return };
+                ctx.io().unwrap().accept(fd, token(kind, 0));
             }
             SAVE => {
                 let len = c.take_buf().map_or(0, |b| b.len());
@@ -1610,6 +1654,9 @@ pub struct Config {
     /// TLS listener on `tls_port`, with this configuration (see `tls::server_config`).
     pub tls: Option<Arc<ServerConfig>>,
     pub tls_port: u16,
+    /// MQTT over WebSocket listener, and over secure WebSocket (needs `tls`).
+    pub ws_port: Option<u16>,
+    pub wss_port: Option<u16>,
     /// Snapshot directory for retained messages and persistent sessions (none: memory only),
     /// and the period of the snapshots (also written at shutdown).
     pub persist_dir: Option<PathBuf>,
@@ -1632,6 +1679,8 @@ impl Default for Config {
             max_core_backlog: 16 << 20,
             tls: None,
             tls_port: 8883,
+            ws_port: None,
+            wss_port: None,
             persist_dir: None,
             autosave: Duration::from_secs(30),
         }
@@ -1649,11 +1698,19 @@ pub fn start(config: &Config) -> std::io::Result<Engine> {
         let persist_dir = config.persist_dir.clone();
         let persist_dir2 = config.persist_dir.clone();
         let autosave = if config.persist_dir.is_some() { config.autosave.as_secs().max(1) as u32 } else { 0 };
-        let listener = net::reuseport_listener(config.ip, config.port, 4096)?;
-        let tls_listener = match config.tls {
-            Some(_) => Some(net::reuseport_listener(config.ip, config.tls_port, 4096)?),
-            None => None,
-        };
+        let mut listeners = vec![(ACCEPT, net::reuseport_listener(config.ip, config.port, 4096)?)];
+        if config.tls.is_some() {
+            listeners.push((ACCEPT_TLS, net::reuseport_listener(config.ip, config.tls_port, 4096)?));
+        }
+        if let Some(port) = config.ws_port {
+            listeners.push((ACCEPT_WS, net::reuseport_listener(config.ip, port, 4096)?));
+        }
+        if let Some(port) = config.wss_port {
+            if config.tls.is_none() {
+                return Err(std::io::Error::other("a secure WebSocket port needs a TLS configuration"));
+            }
+            listeners.push((ACCEPT_WSS, net::reuseport_listener(config.ip, port, 4096)?));
+        }
         let tls_config = config.tls.clone();
         let timer = net::timerfd(TICK)?;
         let connect_timeout = config.connect_timeout.as_secs().max(1) as u32;
@@ -1683,8 +1740,7 @@ pub fn start(config: &Config) -> std::io::Result<Engine> {
         let t = topology.clone();
         let n = seq.add_actor(core, move || Connections {
             topology: t,
-            listener,
-            tls_listener,
+            listeners,
             tls_config,
             timer,
             tick: 0,
