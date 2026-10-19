@@ -465,7 +465,7 @@ fn many_qos1_messages_keep_their_order() {
         let mut acks = p.stream.try_clone().unwrap();
         std::thread::spawn(move || {
             let mut b = [0u8; 4096];
-            while acks.read(&mut b).map_or(false, |n| n > 0) {}
+            while acks.read(&mut b).is_ok_and(|n| n > 0) {}
         })
     };
     for i in 0..20_000u32 {
