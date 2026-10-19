@@ -11,7 +11,7 @@
 //! The broker's CPU and memory come from /proc/<pid> (`--broker-pid`): CPU time from the
 //! `schedstat` of all its threads, memory from `VmRSS`.
 //!
-//! usage: mqtt-bench flow|idle --port P --broker-pid PID [--pubs N] [--subs N] [--rate R]
+//! usage: croisette-bench flow|idle --port P --broker-pid PID [--pubs N] [--subs N] [--rate R]
 //!        [--secs S] [--payload B] [--filter F] [--threads T] [--conns N]
 
 use std::collections::HashMap;
@@ -21,7 +21,7 @@ use std::sync::{Arc, Barrier, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use cannes_mqtt::client::Client;
+use croisette::client::Client;
 
 static EPOCH: OnceLock<Instant> = OnceLock::new();
 

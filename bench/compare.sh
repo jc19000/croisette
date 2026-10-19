@@ -1,22 +1,22 @@
 #!/usr/bin/env bash
-# Compares cannes-mqtt with Mosquitto on the same load, same machine.
+# Compares croisette with Mosquitto on the same load, same machine.
 # Brokers are pinned to cores 1 (and 2), the load generator to cores 0 and 3.
 # usage: bench/compare.sh [results-file]
 set -u
 cd "$(dirname "$0")/.."
 cargo build --release -q
 OUT=${1:-bench/results.txt}
-BENCH=./target/release/mqtt-bench
+BENCH=./target/release/croisette-bench
 ONLY=${ONLY:-fanin,fanout,idle}
 [ -n "${APPEND:-}" ] || : > "$OUT"
 
 declare -A BROKERS=(
   [mosquitto]="taskset -c 1 mosquitto -c bench/mosquitto.conf"
-  [cannes-1core-sleep]="./target/release/cannes-mqtt --port 18832 --cores 1 --mode sleep:1000"
-  [cannes-1core-spin]="./target/release/cannes-mqtt --port 18832 --cores 1 --mode spin"
-  [cannes-2cores-adaptive]="./target/release/cannes-mqtt --port 18832 --cores 1,2 --mode adaptive"
+  [croisette-1core-sleep]="./target/release/croisette --port 18832 --cores 1 --mode sleep:1000"
+  [croisette-1core-spin]="./target/release/croisette --port 18832 --cores 1 --mode spin"
+  [croisette-2cores-adaptive]="./target/release/croisette --port 18832 --cores 1,2 --mode adaptive"
 )
-ORDER="mosquitto cannes-1core-sleep cannes-1core-spin cannes-2cores-adaptive"
+ORDER="mosquitto croisette-1core-sleep croisette-1core-spin croisette-2cores-adaptive"
 
 run() { # broker-name, bench args...
   local name=$1; shift

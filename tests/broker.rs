@@ -5,8 +5,8 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 use cannes::CoreMode;
-use cannes_mqtt::broker::{self, Config};
-use cannes_mqtt::client::{Client, Incoming};
+use croisette::broker::{self, Config};
+use croisette::client::{Client, Incoming};
 
 static SERIAL: Mutex<()> = Mutex::new(());
 

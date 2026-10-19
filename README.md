@@ -1,10 +1,10 @@
-# cannes-mqtt: an MQTT broker PoC on cannes
+# croisette
 
 A proof of concept: an MQTT 3.1.1 broker built on the [cannes](https://github.com/jc19000/cannes) thread-per-core
 actor engine, with io_uring for the network, benchmarked against Mosquitto 2.0.18 on the same
 machine and the same load.
 
-**Result in one line:** with one core each, cannes-mqtt delivers about **12x (fan-in) to 16x
+**Result in one line:** with one core each, croisette delivers about **12x (fan-in) to 16x
 (fan-out) more messages per second** than Mosquitto before saturating. At loads both brokers can
 handle, CPU use is similar or lower and tail latency is lower. Two things cost more: idle CPU
 (0.03 core instead of 0.001) and memory per idle connection (1.3 KB instead of 0.8 KB).
@@ -50,7 +50,7 @@ it writes each message to each subscriber as it is routed.
   - ordering of 20k messages.
 
 ```sh
-cargo run --release --bin cannes-mqtt -- --port 1883 --cores 1,2 --mode adaptive
+cargo run --release --bin croisette -- --port 1883 --cores 1,2 --mode adaptive
 ```
 
 Mode values:
@@ -68,7 +68,7 @@ Mode values:
 - **Pinning:** the brokers run on core 1 (and core 2 for the two-core run). The load generator
   runs on cores 0 and 3.
 - **Mosquitto:** 2.0.18 with `bench/mosquitto.conf` (TCP_NODELAY, no logging, unbounded queues).
-- **Load generator:** `src/bin/mqtt-bench.rs`.
+- **Load generator:** `src/bin/croisette-bench.rs`.
   - Publishers send open-loop with Poisson arrivals, so a slow broker cannot slow the load down
     (no coordinated omission).
   - Each message carries the time it was *scheduled* to be sent. Latency is measured from that
@@ -85,7 +85,7 @@ offered rate at which `delivered = offered`.
 
 ### Fan-in: 10 publishers → 1 subscriber on `bench/#`, one broker core
 
-| Offered msg/s | Mosquitto delivered | CPU | p50 / p99 | cannes (sleep) delivered | CPU | p50 / p99 |
+| Offered msg/s | Mosquitto delivered | CPU | p50 / p99 | croisette (sleep) delivered | CPU | p50 / p99 |
 |---:|---:|---:|---|---:|---:|---|
 | 20 000 | 20 029 | 0.44 | 51 µs / 1.5 ms | 20 029 | 0.48 | 56 µs / 1.4 ms |
 | 100 000 | **77 147 (saturated)** | 0.98 | >100 ms | 100 162 | 0.88 | 61 µs / 2.0 ms |
@@ -94,14 +94,14 @@ offered rate at which `delivered = offered`.
 | 1 000 000 | 75 824 | 0.98 | >100 ms | 1 000 552 | 0.96 | 215 µs / 58 ms |
 | 2 000 000 | 71 357 | 0.99 | >100 ms | **1 844 757 (saturated)** | 0.97 | >100 ms |
 
-Mosquitto saturates at about 80k msg/s, which is about 12 µs of CPU per message. cannes-mqtt
+Mosquitto saturates at about 80k msg/s, which is about 12 µs of CPU per message. croisette
 sustains 1M msg/s on the same core, at under 1 µs of CPU per message.
 
 ### Fan-out: 1 publisher on `bench/0` → 50 subscribers, one broker core
 
 The deliveries column counts deliveries: 50 × the publish rate.
 
-| Publish msg/s → deliveries/s | Mosquitto delivered | CPU | p50 / p99 | cannes (sleep) delivered | CPU | p50 / p99 |
+| Publish msg/s → deliveries/s | Mosquitto delivered | CPU | p50 / p99 | croisette (sleep) delivered | CPU | p50 / p99 |
 |---:|---:|---:|---|---:|---:|---|
 | 1 000 → 51 200 | 51 202 | 0.48 | 670 µs / 64 ms | 51 189 | **0.34** | 498 µs / 2.3 ms |
 | 2 000 → 102 000 | **105 845 (saturated)** | 0.93 | 51 ms / >100 ms | 100 420 | 0.52 | 536 µs / 3.6 ms |
@@ -111,14 +111,14 @@ The deliveries column counts deliveries: 50 × the publish rate.
 | 40 000 → 2 000 000 | 114 268 | 0.99 | >100 ms | 2 006 371 | 0.98 | 3.6 ms / >100 ms |
 
 - Mosquitto peaks at about 125k deliveries/s.
-- cannes-mqtt keeps up with 2M deliveries/s on one core, at 0.5 µs of CPU per delivery. At that
+- croisette keeps up with 2M deliveries/s on one core, at 0.5 µs of CPU per delivery. At that
   rate the load generator's single reader thread, serving 50 sockets, is what adds the latency.
-- At the lowest rate, both brokers keep up. cannes-mqtt uses 30 % less CPU and its p99 is 28x
+- At the lowest rate, both brokers keep up. croisette uses 30 % less CPU and its p99 is 28x
   lower.
 
 ### Idle: 10 000 connections that send nothing
 
-| | Mosquitto | cannes `sleep:1000` | cannes `spin` | cannes 2 cores `adaptive` |
+| | Mosquitto | croisette `sleep:1000` | croisette `spin` | croisette 2 cores `adaptive` |
 |---|---:|---:|---:|---:|
 | Memory per connection | **0.78 KB** | 1.29 KB | 1.29 KB | 1.31 KB |
 | CPU while idle | **0.001 core** | 0.034 core | 0.99 core | 0.68 core |
@@ -147,7 +147,7 @@ These rows are the ones that matter for a pay-per-use cloud service:
 
 - A broker core running Mosquitto saturates at about 80k msg/s (fan-in) or 125k deliveries/s
   (fan-out).
-- On this machine, the same core running cannes-mqtt handles 1M–2M.
+- On this machine, the same core running croisette handles 1M–2M.
 - For the same traffic, that is roughly an order of magnitude fewer broker cores, with the same
   protocol and the same clients.
 
@@ -156,5 +156,5 @@ These rows are the ones that matter for a pay-per-use cloud service:
 - This is a PoC. Persistence, QoS 1/2 delivery and TLS all add CPU per message and are not
   implemented. TLS in particular would narrow the gap.
 - The results come from one VM over loopback.
-- Idle-heavy IoT fleets (many connections, little traffic) are the case where cannes-mqtt does not
+- Idle-heavy IoT fleets (many connections, little traffic) are the case where croisette does not
   win yet.

@@ -1,11 +1,11 @@
 [package]
-name = "cannes-mqtt"
+name = "croisette"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.82"
 description = "Proof of concept: an MQTT 3.1.1 broker on the cannes thread-per-core actor engine, with io_uring"
 license = "Apache-2.0"
-repository = "https://github.com/jc19000/cannes-mqtt"
+repository = "https://github.com/jc19000/croisette"
 publish = false
 
 [dependencies]

@@ -17,17 +17,17 @@ dependencies = [
 ]
 
 [[package]]
-name = "cannes-mqtt"
-version = "0.1.0"
-dependencies = [
- "cannes",
-]
-
-[[package]]
 name = "cfg-if"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
+
+[[package]]
+name = "croisette"
+version = "0.1.0"
+dependencies = [
+ "cannes",
+]
 
 [[package]]
 name = "io-uring"

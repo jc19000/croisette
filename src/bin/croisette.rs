@@ -1,6 +1,6 @@
 //! MQTT broker on cannes.
 //!
-//! usage: cannes-mqtt [--port 1883] [--cores 1,2] [--mode MODE]
+//! usage: croisette [--port 1883] [--cores 1,2] [--mode MODE]
 //!
 //! MODE: `spin`, `adaptive` (2000 idle loops, then 50 µs sleeps), `adaptive:<loops>:<µs>`,
 //! `sleep:<µs>` (wait in io_uring after each idle iteration, an I/O completion ends the wait).
@@ -8,7 +8,7 @@
 use std::time::Duration;
 
 use cannes::CoreMode;
-use cannes_mqtt::broker::{self, Config};
+use croisette::broker::{self, Config};
 
 fn main() {
     let mut config = Config::default();
@@ -35,7 +35,7 @@ fn main() {
         }
     }
     let _engine = broker::start(&config).expect("broker start");
-    eprintln!("cannes-mqtt listening on port {} on cores {:?} ({:?})", config.port, config.cores, config.mode);
+    eprintln!("croisette listening on port {} on cores {:?} ({:?})", config.port, config.cores, config.mode);
     loop {
         std::thread::park();
     }
