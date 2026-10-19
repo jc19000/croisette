@@ -193,8 +193,10 @@ fn flow(args: &Args, addr: SocketAddr, pid: u32) {
             let ids: Vec<usize> = (0..pubs).filter(|i| i % writers_n == t).collect();
             let (stop, measuring, start, sent) = (stop.clone(), measuring.clone(), start.clone(), sent.clone());
             thread::spawn(move || {
-                let mut clients: Vec<(Client, String)> =
-                    ids.iter().map(|i| (connect_retry(addr, &format!("bench-pub-{i}")), format!("bench/{i}"))).collect();
+                let mut clients: Vec<(Client, String)> = ids
+                    .iter()
+                    .map(|i| (connect_retry(addr, &format!("bench-pub-{i}")), format!("bench/{i}")))
+                    .collect();
                 let per_thread = rate / writers_n as f64;
                 let mut payload = vec![0u8; payload_len];
                 let mut rng = 0x9e37_79b9_7f4a_7c15u64 ^ t as u64;
@@ -225,7 +227,7 @@ fn flow(args: &Args, addr: SocketAddr, pid: u32) {
                         let ts = now_ns();
                         payload[..8].copy_from_slice(&ts.to_le_bytes());
                         let len = clients.len();
-                            let (c, topic) = &mut clients[next % len];
+                        let (c, topic) = &mut clients[next % len];
                         for _ in 0..64 {
                             c.queue_publish(topic, &payload, 0, false);
                         }
