@@ -725,3 +725,42 @@ fn qos2_state_survives_reconnection() {
     assert_eq!(dev.next_publish().unwrap(), msg(b"3"));
     engine.shutdown();
 }
+
+// ---- $SYS ---------------------------------------------------------------------------------------
+
+#[test]
+fn sys_topics_report_the_totals_of_every_core() {
+    let _g = serial();
+    let (engine, addr) =
+        start_with(Config { cores: vec![1, 2], sys_interval: Duration::from_secs(1), ..Config::default() });
+    let mut all = client(addr, "all");
+    all.subscribe(&["#"]).unwrap();
+    let mut p = client(addr, "p");
+    for _ in 0..5 {
+        p.publish("t", b"x", 1, false).unwrap();
+    }
+    for _ in 0..5 {
+        all.next_publish().unwrap();
+    }
+    let mut sys = client(addr, "sys");
+    sys.subscribe(&["$SYS/broker/#"]).unwrap();
+    let mut values = std::collections::HashMap::new();
+    let t = Instant::now();
+    while t.elapsed() < Duration::from_secs(4) {
+        if let Ok(Incoming::Publish { topic, payload, .. }) = sys.next_publish() {
+            values.insert(topic, String::from_utf8(payload).unwrap());
+        }
+        let received: u64 = values.get("$SYS/broker/messages/received").map_or(0, |v| v.parse().unwrap());
+        if received >= 5 && values.len() >= 11 {
+            break;
+        }
+    }
+    assert!(values["$SYS/broker/version"].starts_with("croisette "), "{values:?}");
+    assert_eq!(values["$SYS/broker/clients/connected"], "3");
+    assert_eq!(values["$SYS/broker/messages/received"], "5");
+    assert_eq!(values["$SYS/broker/messages/sent"], "5");
+    assert_eq!(values["$SYS/broker/sessions/count"], "3");
+    // `#` does not match `$SYS` topics.
+    assert_nothing(&mut all);
+    engine.shutdown();
+}

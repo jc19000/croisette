@@ -130,6 +130,21 @@ struct Park {
     state: Undelivered,
 }
 
+/// Counters of a core's connection tier, sent every `sys_interval` to the first core, which
+/// publishes the totals under `$SYS/broker/`.
+#[derive(Clone, Copy, Default)]
+struct Stats {
+    round: u32,
+    connections: u64,
+    received: u64,
+    delivered: u64,
+    dropped: u64,
+    bytes_in: u64,
+    bytes_out: u64,
+    retained: u64,
+    sessions: u64,
+}
+
 /// Close a connection: its client id was taken over by a new connection.
 struct Kick {
     conn: u64,
@@ -482,6 +497,17 @@ pub struct Connections {
     max_inflight: usize,
     /// Messages dropped because the subscriber's output queue was full.
     pub dropped: u64,
+    /// PUBLISH packets received from clients.
+    pub received_msgs: u64,
+    /// Messages queued to clients.
+    pub delivered: u64,
+    pub bytes_in: u64,
+    pub bytes_out: u64,
+    /// `$SYS` period in ticks (0: none), start time, and on the first core the last stats of
+    /// each core.
+    sys_interval: u32,
+    started: std::time::Instant,
+    stats: Vec<Option<Stats>>,
     router: Option<ActorRef<Router>>,
     contexts: Option<ActorRef<Contexts>>,
     /// Persistent-session connections closed in the last ticks: (context core, session id,
@@ -635,6 +661,7 @@ impl Connections {
             self.close(ctx, id);
             return;
         }
+        self.bytes_in += result as u64;
         let mut consumed = 0;
         loop {
             match codec::parse_limited(&buf[consumed..], self.max_packet) {
@@ -701,6 +728,24 @@ impl Connections {
             self.close(ctx, id);
         }
         self.forwards.retain(|_, f| tick.wrapping_sub(f.2) <= 2);
+        if self.sys_interval > 0 && tick % self.sys_interval == 0 {
+            let (retained, sessions) = {
+                let c = self.contexts.as_ref().unwrap().borrow();
+                (c.retained.len() as u64, c.sessions.len() as u64)
+            };
+            let stats = Stats {
+                round: tick / self.sys_interval,
+                connections: self.open as u64,
+                received: self.received_msgs,
+                delivered: self.delivered,
+                dropped: self.dropped,
+                bytes_in: self.bytes_in,
+                bytes_out: self.bytes_out,
+                retained,
+                sessions,
+            };
+            ctx.send(actor(self.topology.cores[0], CONNECTIONS), stats);
+        }
     }
 
     /// Handles one packet from connection `id`.
@@ -762,6 +807,7 @@ impl Connections {
                         return Next::Continue;
                     }
                 }
+                self.received_msgs += 1;
                 if retain {
                     let partition = self.topology.partition(topic);
                     ctx.send(actor(partition, CONTEXT), Retain { topic: topic.into(), payload: payload.to_vec(), qos });
@@ -904,26 +950,35 @@ impl Connections {
             }
             return;
         };
-        if qos == 0 {
+        // 0: dropped, 1: waits for room in the window, 2: queued for sending.
+        let outcome = if qos == 0 {
             if c.out.len() >= max_queued {
-                self.dropped += 1;
-                return;
+                0
+            } else {
+                c.out.extend_from_slice(packet);
+                2
             }
-            c.out.extend_from_slice(packet);
         } else {
             let ob = c.outbound.get_or_insert_with(Default::default);
             if ob.inflight.len() < max_inflight {
                 ob.send(&mut c.out, packet, qos);
+                2
             } else if ob.pending_bytes + c.out.len() < max_queued {
                 ob.pending_bytes += packet.len();
                 ob.pending.push_back((qos, packet.to_vec()));
-                return;
+                1
             } else {
-                self.dropped += 1;
-                return;
+                0
+            }
+        };
+        match outcome {
+            0 => self.dropped += 1,
+            1 => self.delivered += 1,
+            _ => {
+                self.delivered += 1;
+                self.mark_dirty(ctx, id);
             }
         }
-        self.mark_dirty(ctx, id);
     }
 
     /// PUBACK or PUBCOMP from connection `id`: frees a slot of its window for the next pending
@@ -951,6 +1006,7 @@ impl Connections {
             self.close(ctx, id);
             return;
         }
+        self.bytes_out += result as u64;
         let Some(conn) = self.get(id) else { return };
         buf.drain(..result as usize);
         let fd = conn.fd;
@@ -979,6 +1035,7 @@ impl Actor for Connections {
         ctx.register_handler::<Deliver, Self>();
         ctx.register_handler::<Kick, Self>();
         ctx.register_handler::<Opened, Self>();
+        ctx.register_handler::<Stats, Self>();
         let router = actor(ctx.core(), ROUTER);
         self.router = Some(ctx.reference_local_actor::<Router>(router).expect("router on this core"));
         let contexts = actor(ctx.core(), CONTEXT);
@@ -1117,6 +1174,51 @@ impl Handler<Opened> for Connections {
     }
 }
 
+impl Handler<Stats> for Connections {
+    /// First core: once every core reported for a round, publishes the totals, retained.
+    fn on_event(&mut self, ctx: &mut Context, src: ActorId, st: &Stats) {
+        let cores = self.topology.cores.len();
+        self.stats.resize(cores, None);
+        let Some(i) = self.topology.cores.iter().position(|&c| c == src.core as CoreId) else { return };
+        self.stats[i] = Some(*st);
+        if !self.stats.iter().all(|s| s.is_some_and(|s| s.round == st.round)) {
+            return;
+        }
+        let total = self.stats.iter().flatten().fold(Stats::default(), |a, s| Stats {
+            round: s.round,
+            connections: a.connections + s.connections,
+            received: a.received + s.received,
+            delivered: a.delivered + s.delivered,
+            dropped: a.dropped + s.dropped,
+            bytes_in: a.bytes_in + s.bytes_in,
+            bytes_out: a.bytes_out + s.bytes_out,
+            retained: a.retained + s.retained,
+            sessions: a.sessions + s.sessions,
+        });
+        let subscriptions = self.router.as_ref().unwrap().borrow().index.len() as u64;
+        let values = [
+            ("version", concat!("croisette ", env!("CARGO_PKG_VERSION")).to_string()),
+            ("uptime", format!("{} seconds", self.started.elapsed().as_secs())),
+            ("clients/connected", total.connections.to_string()),
+            ("messages/received", total.received.to_string()),
+            ("messages/sent", total.delivered.to_string()),
+            ("messages/dropped", total.dropped.to_string()),
+            ("bytes/received", total.bytes_in.to_string()),
+            ("bytes/sent", total.bytes_out.to_string()),
+            ("subscriptions/count", subscriptions.to_string()),
+            ("retained messages/count", total.retained.to_string()),
+            ("sessions/count", total.sessions.to_string()),
+        ];
+        for (name, value) in values {
+            let topic = format!("$SYS/broker/{name}");
+            let partition = self.topology.partition(&topic);
+            let retain = Retain { topic: topic.as_str().into(), payload: value.clone().into_bytes(), qos: 0 };
+            ctx.send(actor(partition, CONTEXT), retain);
+            self.publish(ctx, &topic, value.as_bytes(), 0);
+        }
+    }
+}
+
 impl Handler<Kick> for Connections {
     fn on_event(&mut self, ctx: &mut Context, _src: ActorId, k: &Kick) {
         self.close(ctx, k.conn);
@@ -1138,6 +1240,8 @@ pub struct Config {
     pub max_queued: usize,
     /// QoS 1 messages sent to a connection and not acknowledged yet, at most.
     pub max_inflight: usize,
+    /// Period of the `$SYS/broker/...` statistics (rounded to seconds; zero: none).
+    pub sys_interval: Duration,
 }
 
 impl Default for Config {
@@ -1151,6 +1255,7 @@ impl Default for Config {
             max_packet: codec::MAX_PACKET,
             max_queued: 4 << 20,
             max_inflight: 32,
+            sys_interval: Duration::from_secs(10),
         }
     }
 }
@@ -1165,6 +1270,7 @@ pub fn start(config: &Config) -> std::io::Result<Engine> {
         let timer = net::timerfd(TICK)?;
         let connect_timeout = config.connect_timeout.as_secs().max(1) as u32;
         let (max_packet, max_queued, max_inflight) = (config.max_packet, config.max_queued, config.max_inflight);
+        let sys_interval = config.sys_interval.as_secs() as u32;
         seq.core_mode(core, config.mode);
         seq.io_uring(core, 4096);
         // Added in this order on every core, so that their ids are known up front.
@@ -1189,6 +1295,13 @@ pub fn start(config: &Config) -> std::io::Result<Engine> {
             max_queued,
             max_inflight,
             dropped: 0,
+            received_msgs: 0,
+            delivered: 0,
+            bytes_in: 0,
+            bytes_out: 0,
+            sys_interval,
+            started: std::time::Instant::now(),
+            stats: Vec::new(),
             router: None,
             contexts: None,
             forwards: HashMap::new(),
