@@ -568,7 +568,7 @@ impl Contexts {
 
     /// Ends the offline sessions whose expiry interval passed.
     /// Also returns the delayed wills now due.
-    fn expire(&mut self, ctx: &mut Context, now: u64) -> Vec<Box<OwnedWill>> {
+    fn expire(&mut self, ctx: &mut Context, now: u64) -> Vec<OwnedWill> {
         let expired: Vec<u32> = self
             .sessions
             .iter()
@@ -593,7 +593,7 @@ impl Contexts {
             .filter(|(id, (t, _))| now >= *t || !self.by_client.contains_key(*id))
             .map(|(id, _)| id.clone())
             .collect();
-        due.iter().filter_map(|id| self.wills.remove(id)).map(|(_, w)| w).collect()
+        due.iter().filter_map(|id| self.wills.remove(id)).map(|(_, w)| *w).collect()
     }
 }
 
