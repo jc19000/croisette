@@ -1325,3 +1325,34 @@ fn mqtt5_disconnects_with_reason_codes() {
     assert_eq!(watcher.next_publish().unwrap(), publish_msg("wills/w", b"bye"));
     engine.shutdown();
 }
+
+#[test]
+fn mqtt5_will_delay() {
+    let _g = serial();
+    let (engine, addr) = start(vec![1, 2]);
+    let mut watcher = client(addr, "watcher");
+    watcher.subscribe(&["wills/#"]).unwrap();
+    let delayed = |id: &'static str, delay: u32| Connect {
+        level: 5,
+        client_id: id,
+        clean_session: false,
+        session_expiry: Some(600),
+        will: Some(Will { topic: "wills/x", payload: id.as_bytes(), delay: Some(delay), ..Will::default() }),
+        ..Connect::default()
+    };
+    // Published after its delay.
+    let (late, _) = Client::connect_with(addr, &delayed("late", 2)).unwrap();
+    let t = Instant::now();
+    drop(late);
+    assert_eq!(watcher.next_publish().unwrap(), publish_msg("wills/x", b"late"));
+    assert!(t.elapsed() >= Duration::from_millis(1500), "{:?}", t.elapsed());
+    // Not published if the client comes back within the delay.
+    let (back, _) = Client::connect_with(addr, &delayed("back", 3)).unwrap();
+    drop(back);
+    std::thread::sleep(Duration::from_millis(300));
+    let (_back, present) = Client::connect_with(addr, &delayed("back", 3)).unwrap();
+    assert!(present);
+    watcher.set_timeout(Some(Duration::from_millis(4500))).unwrap();
+    assert!(watcher.next_publish().is_err(), "no will after a reconnection");
+    engine.shutdown();
+}

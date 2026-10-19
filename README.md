@@ -113,12 +113,14 @@ versions:
   - the client's Receive Maximum (in-flight window) and Maximum Packet Size are honoured;
   - the broker's maximum packet size is announced.
 - **Subscription options:** No Local, Retain As Published, Retain Handling.
-- **Will:** DISCONNECT with reason 0x04 sends the will.
+- **Will:**
+  - will delay interval: the will waits at the client id's partition, is cancelled if the client
+    comes back, and is sent at the end of the delay or of the session;
+  - DISCONNECT with reason 0x04 sends the will.
 
 Not implemented yet:
 
 - subscription identifiers (announced as unavailable);
-- will delay interval (the will is sent at once);
 - enhanced authentication (AUTH; CONNACK Bad authentication method);
 - topic aliases from the broker to clients;
 - request/response information;
@@ -144,7 +146,7 @@ Mosquitto's model (autosave_interval).
 
 **Tests:**
 
-- `tests/broker.rs`: 34 end-to-end tests with real TCP, TLS and WebSocket clients, MQTT 5 and
+- `tests/broker.rs`: 35 end-to-end tests with real TCP, TLS and WebSocket clients, MQTT 5 and
   3.1.1, on two cores, including a restart from snapshots.
 - Unit tests for the codec, the index and authentication.
 - `tests/interop.sh`: 20 checks with `mosquitto_pub` / `mosquitto_sub`, MQTT 5, TLS and restart

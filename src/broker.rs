@@ -274,6 +274,8 @@ pub struct Contexts {
     persist: Option<PathBuf>,
     /// Sessions restored from a snapshot, whose session targets are not in the routers yet.
     restored: Vec<u32>,
+    /// Delayed wills by client id, with their due time.
+    wills: HashMap<Box<str>, (u64, Box<OwnedWill>)>,
 }
 
 /// A client id's session, on the context partition of the client id.
@@ -315,6 +317,7 @@ impl Actor for Contexts {
         ctx.register_handler::<Unregister, Self>();
         ctx.register_handler::<Park, Self>();
         ctx.register_handler::<SessionFilters, Self>();
+        ctx.register_handler::<DelayedWill, Self>();
         if !self.restored.is_empty() {
             ctx.register_callback(); // events go out once the engine runs
         }
@@ -406,6 +409,12 @@ impl Contexts {
     }
 }
 
+impl Handler<DelayedWill> for Contexts {
+    fn on_event(&mut self, _ctx: &mut Context, _src: ActorId, d: &DelayedWill) {
+        self.wills.insert(d.client_id.clone(), (d.due, d.will.clone()));
+    }
+}
+
 impl Handler<SessionFilters> for Contexts {
     fn on_event(&mut self, _ctx: &mut Context, _src: ActorId, f: &SessionFilters) {
         let Some(sid) = self.by_client.get(&f.client_id) else { return };
@@ -420,6 +429,7 @@ impl Contexts {
     /// Gives session `sid` to connection `sub` (fresh session if `clean` or none): replies
     /// `Opened`, with the state of a persistent session left offline.
     fn open(&mut self, ctx: &mut Context, client_id: &str, sub: Sub, clean: bool, expiry: u32) {
+        self.wills.remove(client_id); // reconnected within the will delay: no will
         let existing = self.by_client.get(client_id).copied();
         if let Some(sid) = existing {
             let s = self.sessions.get_mut(&sid).unwrap();
@@ -557,7 +567,8 @@ impl Contexts {
     }
 
     /// Ends the offline sessions whose expiry interval passed.
-    pub fn expire(&mut self, ctx: &mut Context, now: u64) {
+    /// Also returns the delayed wills now due.
+    fn expire(&mut self, ctx: &mut Context, now: u64) -> Vec<Box<OwnedWill>> {
         let expired: Vec<u32> = self
             .sessions
             .iter()
@@ -572,6 +583,17 @@ impl Contexts {
             self.discard(ctx, sid);
         }
         self.retained.retain(|_, r| r.expires.is_none_or(|t| now < t));
+        if self.wills.is_empty() {
+            return Vec::new();
+        }
+        // A will is due after its delay, or when its session ended before.
+        let due: Vec<Box<str>> = self
+            .wills
+            .iter()
+            .filter(|(id, (t, _))| now >= *t || !self.by_client.contains_key(*id))
+            .map(|(id, _)| id.clone())
+            .collect();
+        due.iter().filter_map(|id| self.wills.remove(id)).map(|(_, w)| w).collect()
     }
 }
 
@@ -637,6 +659,7 @@ fn token(kind: u64, conn: u64) -> u64 {
     kind << 56 | conn
 }
 
+#[derive(Clone)]
 struct OwnedWill {
     topic: Box<str>,
     payload: Vec<u8>,
@@ -644,6 +667,16 @@ struct OwnedWill {
     retain: bool,
     props: Vec<u8>,
     expiry: Option<u32>,
+    /// MQTT 5 will delay interval, seconds.
+    delay: u32,
+}
+
+/// connection -> context: a will to publish after its delay, unless the client reconnects first
+/// (or at once if its session ends before).
+struct DelayedWill {
+    client_id: Box<str>,
+    will: Box<OwnedWill>,
+    due: u64,
 }
 
 /// QoS 1 and 2 state of a connection, allocated with its first QoS 1 or 2 message: messages sent
@@ -877,6 +910,22 @@ impl Connections {
         ctx.io().unwrap().recv(fd, Vec::with_capacity(RECV_MIN), token(RECV, id));
     }
 
+    fn publish_will(&mut self, ctx: &mut Context, will: &OwnedWill) {
+        let expires = will.expiry.map(|e| unix_now() + e as u64);
+        if will.retain {
+            let partition = self.topology.partition(&will.topic);
+            let retain = Retain {
+                topic: will.topic.clone(),
+                payload: will.payload.clone(),
+                qos: will.qos,
+                props: will.props.clone(),
+                expires,
+            };
+            ctx.send(actor(partition, CONTEXT), retain);
+        }
+        self.publish(ctx, &will.topic, &will.payload, will.qos, &will.props, expires, will.retain, None);
+    }
+
     /// Adds a subscription to this core's index and broadcasts it to the other cores.
     fn add_sub(&mut self, ctx: &mut Context, filter: &str, sub: Sub, qos: u8) {
         self.router.as_ref().unwrap().borrow_mut().index.add(filter, sub, qos);
@@ -920,19 +969,14 @@ impl Connections {
             self.remove_sub(ctx, filter, sub);
         }
         if let Some(will) = conn.will {
-            let expires = will.expiry.map(|e| unix_now() + e as u64);
-            if will.retain {
-                let partition = self.topology.partition(&will.topic);
-                let retain = Retain {
-                    topic: will.topic.clone(),
-                    payload: will.payload.clone(),
-                    qos: will.qos,
-                    props: will.props.clone(),
-                    expires,
-                };
-                ctx.send(actor(partition, CONTEXT), retain);
+            match &conn.client_id {
+                Some(client_id) if will.delay > 0 => {
+                    let partition = self.topology.partition(client_id);
+                    let due = unix_now() + will.delay as u64;
+                    ctx.send(actor(partition, CONTEXT), DelayedWill { client_id: client_id.clone(), will, due });
+                }
+                _ => self.publish_will(ctx, &will),
             }
-            self.publish(ctx, &will.topic, &will.payload, will.qos, &will.props, expires, will.retain, None);
         }
         if let Some(client_id) = conn.client_id {
             let partition = self.topology.partition(&client_id);
@@ -1151,7 +1195,10 @@ impl Connections {
         for id in expired {
             self.disconnect(ctx, id, reason::KEEP_ALIVE_TIMEOUT);
         }
-        self.contexts.as_ref().unwrap().borrow_mut().expire(ctx, unix_now());
+        let wills = self.contexts.as_ref().unwrap().borrow_mut().expire(ctx, unix_now());
+        for will in wills {
+            self.publish_will(ctx, &will);
+        }
         self.forwards.retain(|_, f| tick.wrapping_sub(f.2) <= 2);
         if self.autosave > 0 && tick % self.autosave == 0 && self.saving.is_none() {
             self.save(ctx);
@@ -1232,6 +1279,7 @@ impl Connections {
                         retain: w.retain,
                         props: w.props,
                         expiry: w.expiry,
+                        delay: w.delay.unwrap_or(0),
                     })
                 });
                 let expiry = match (v5, c.clean_session) {
@@ -2052,6 +2100,7 @@ pub fn start(config: &Config) -> std::io::Result<Engine> {
                 max_queued,
                 persist: persist_dir,
                 restored: Vec::new(),
+                wills: HashMap::new(),
             };
             c.restore(saved);
             c
