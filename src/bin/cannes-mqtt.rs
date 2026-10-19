@@ -1,7 +1,13 @@
 //! MQTT broker on cannes.
 //!
-//! usage: cannes-mqtt [--port 1883] [--cores 1,2] [--mode spin|adaptive]
+//! usage: cannes-mqtt [--port 1883] [--cores 1,2] [--mode MODE]
+//!
+//! MODE: `spin`, `adaptive` (2000 idle loops, then 50 µs sleeps), `adaptive:<loops>:<µs>`,
+//! `sleep:<µs>` (wait in io_uring after each idle iteration, an I/O completion ends the wait).
 
+use std::time::Duration;
+
+use cannes::CoreMode;
 use cannes_mqtt::broker::{self, Config};
 
 fn main() {
@@ -13,10 +19,16 @@ fn main() {
             "--port" => config.port = value.parse().expect("port"),
             "--cores" => config.cores = value.split(',').map(|c| c.parse().expect("core")).collect(),
             "--mode" => {
-                config.mode = match value.as_str() {
-                    "spin" => cannes::CoreMode::Spin,
-                    "adaptive" => broker::adaptive(),
-                    other => panic!("unknown mode {other}"),
+                let us = |v: &str| Duration::from_micros(v.parse().expect("microseconds"));
+                let parts: Vec<&str> = value.split(':').collect();
+                config.mode = match parts[..] {
+                    ["spin"] => CoreMode::Spin,
+                    ["adaptive"] => broker::adaptive(),
+                    ["adaptive", loops, sleep] => {
+                        CoreMode::Adaptive { idle_loops: loops.parse().expect("loops"), sleep: us(sleep) }
+                    }
+                    ["sleep", sleep] => CoreMode::Sleep(us(sleep)),
+                    _ => panic!("unknown mode {value}"),
                 }
             }
             other => panic!("unknown option {other}"),
