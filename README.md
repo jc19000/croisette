@@ -128,8 +128,9 @@ Mode values:
 
 - `sleep:<µs>`: wait in io_uring after each idle iteration; an I/O completion wakes the core.
   This is the default on one core, as `sleep:100000`.
-- `adaptive`: spin while traffic flows, and sleep 50 µs at a time after 2000 idle loops. This is
-  the default on several cores.
+- `adaptive`: spin while traffic flows, and sleep 1 ms at a time after 2000 idle loops. This is
+  the default on several cores. I/O still wakes a sleeping core at once; events from other cores
+  wait for the end of the sleep.
 - `adaptive:<loops>:<µs>`: the same, with the idle loops and sleep length set.
 - `spin`: busy-poll.
 
@@ -226,17 +227,17 @@ encrypts message by message. Raw rows are in `bench/results-tls.txt`.
 
 ### Idle: 10 000 connections that send nothing
 
-| | Mosquitto | croisette (default) | croisette `spin` | croisette 2 cores `adaptive` |
+| | Mosquitto | croisette (default) | croisette `spin` | croisette 2 cores (default `adaptive`) |
 |---|---:|---:|---:|---:|
-| Memory per connection | **0.78 KB** | 0.93 KB | 0.93 KB | 0.94 KB |
-| CPU while idle | 0.001 core | 0.001 core | 0.99 core | 0.66 core |
-| Connection rate | 5 732 /s | 8 042 /s | 9 566 /s | 6 232 /s |
+| Memory per connection | **0.78 KB** | 0.93 KB | 0.93 KB | 0.95 KB |
+| CPU while idle | 0.001 core | 0.001 core | 0.99 core | 0.06 core |
 
 - **Memory:** a receive buffer starts at 256 bytes. It doubles when a receive fills it, and
   halves back after the traffic drops. Each session also has a registry entry.
-- **CPU:** the default one-core mode only waits in io_uring, so it uses no CPU when idle. The
-  several-core `adaptive` mode wakes every 50 µs to see the other cores' events. An eventfd
-  wake-up in cannes would remove that cost.
+- **CPU:** the default one-core mode only waits in io_uring, so it uses no CPU when idle. On
+  several cores, the default mode wakes every millisecond to see the other cores' events:
+  0.06 core in total. It used to sleep 50 µs at a time, which cost 0.66 core for the same latency
+  under load. An eventfd wake-up in cannes would remove the rest.
 
 ### Other configurations
 

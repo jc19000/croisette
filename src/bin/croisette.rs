@@ -6,7 +6,7 @@
 //!        [--tls-cert PEM --tls-key PEM [--tls-port 8883]] [--persist-dir DIR [--autosave SECONDS]]
 //!        croisette hash-password USER PASSWORD     (prints a password file line)
 //!
-//! MODE: `spin`, `adaptive` (2000 idle loops, then 50 µs sleeps), `adaptive:<loops>:<µs>`,
+//! MODE: `spin`, `adaptive` (2000 idle loops, then 1 ms sleeps), `adaptive:<loops>:<µs>`,
 //! `sleep:<µs>` (wait in io_uring after each idle iteration, an I/O completion ends the wait).
 //! Default: `sleep:100000` on one core, `adaptive` on several.
 
