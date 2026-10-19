@@ -7,16 +7,16 @@ cd "$(dirname "$0")/.."
 cargo build --release -q
 OUT=${1:-bench/results.txt}
 BENCH=./target/release/croisette-bench
-ONLY=${ONLY:-fanin,fanout,idle}
+ONLY=${ONLY:-fanin,fanout,qos1,idle}
 [ -n "${APPEND:-}" ] || : > "$OUT"
 
 declare -A BROKERS=(
   [mosquitto]="taskset -c 1 mosquitto -c bench/mosquitto.conf"
-  [croisette-1core-sleep]="./target/release/croisette --port 18832 --cores 1 --mode sleep:1000"
+  [croisette-1core]="./target/release/croisette --port 18832 --cores 1"
   [croisette-1core-spin]="./target/release/croisette --port 18832 --cores 1 --mode spin"
   [croisette-2cores-adaptive]="./target/release/croisette --port 18832 --cores 1,2 --mode adaptive"
 )
-ORDER="mosquitto croisette-1core-sleep croisette-1core-spin croisette-2cores-adaptive"
+ORDER=${ORDER:-mosquitto croisette-1core croisette-1core-spin croisette-2cores-adaptive}
 
 run() { # broker-name, bench args...
   local name=$1; shift
@@ -37,6 +37,10 @@ for b in $ORDER; do
   # Fan-out: 1 publisher on bench/0, 50 subscribers: deliveries = 50 x rate.
   [[ $ONLY == *fanout* ]] && for r in 1000 2000 4000 10000 20000 40000; do
     run "$b" flow --pubs 1 --subs 50 --filter bench/0 --rate $r --secs 4 --warmup 1 --threads 1
+  done
+  # QoS 1 end to end: 10 publishers, 1 subscriber, everything acknowledged.
+  [[ $ONLY == *qos1* ]] && for r in 10000 20000 50000 100000 200000; do
+    run "$b" flow --pubs 10 --subs 1 --rate $r --secs 4 --warmup 1 --qos 1
   done
   # Idle connections: memory per connection, CPU while nothing happens.
   [[ $ONLY == *idle* ]] && run "$b" idle --conns 10000 --secs 5
