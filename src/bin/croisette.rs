@@ -3,6 +3,7 @@
 //! usage: croisette [--port 1883] [--cores 1,2] [--mode MODE] [--max-queued BYTES]
 //!        [--max-packet BYTES] [--max-inflight MESSAGES] [--connect-timeout SECONDS]
 //!        [--sys-interval SECONDS] [--passwd FILE] [--acl FILE] [--allow-anonymous true|false]
+//!        [--tls-cert PEM --tls-key PEM [--tls-port 8883]]
 //!        croisette hash-password USER PASSWORD     (prints a password file line)
 //!
 //! MODE: `spin`, `adaptive` (2000 idle loops, then 50 µs sleeps), `adaptive:<loops>:<µs>`,
@@ -29,6 +30,7 @@ fn main() {
     }
     let (mut passwd, mut acl, mut anonymous) = (None, None, true);
     let mut mode = None;
+    let (mut tls_cert, mut tls_key) = (None, None);
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         let value = args.next().unwrap_or_else(|| panic!("{arg} needs a value"));
@@ -54,6 +56,9 @@ fn main() {
             "--max-inflight" => config.max_inflight = value.parse().expect("messages"),
             "--sys-interval" => config.sys_interval = Duration::from_secs(value.parse().expect("seconds")),
             "--passwd" => passwd = Some(PathBuf::from(value)),
+            "--tls-cert" => tls_cert = Some(PathBuf::from(value)),
+            "--tls-key" => tls_key = Some(PathBuf::from(value)),
+            "--tls-port" => config.tls_port = value.parse().expect("port"),
             "--acl" => acl = Some(PathBuf::from(value)),
             "--allow-anonymous" => anonymous = value.parse().expect("true or false"),
             other => panic!("unknown option {other}"),
@@ -70,8 +75,14 @@ fn main() {
     } else {
         broker::adaptive()
     });
+    match (tls_cert, tls_key) {
+        (Some(cert), Some(key)) => config.tls = Some(croisette::tls::server_config(&cert, &key).expect("TLS certificate")),
+        (None, None) => {}
+        _ => panic!("--tls-cert and --tls-key go together"),
+    }
     let _engine = broker::start(&config).expect("broker start");
-    eprintln!("croisette listening on port {} on cores {:?} ({:?})", config.port, config.cores, config.mode);
+    let tls = config.tls.as_ref().map(|_| format!(", TLS on port {}", config.tls_port)).unwrap_or_default();
+    eprintln!("croisette listening on port {}{tls} on cores {:?} ({:?})", config.port, config.cores, config.mode);
     loop {
         std::thread::park();
     }

@@ -12,6 +12,9 @@ publish = false
 # Switch to the crates.io release once cannes 0.2.0 is published.
 cannes = { version = "0.2", git = "https://github.com/jc19000/cannes", branch = "main", features = ["io-uring"] }
 
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+
 [profile.release]
 opt-level = 3
 lto = "fat"

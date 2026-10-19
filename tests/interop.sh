@@ -59,6 +59,19 @@ wait $A $B
 check "shared subscription" "4" "$(cat "$DIR/sh1" "$DIR/sh2" | sort -u | wc -l | tr -d ' ')"
 stop
 
+start --tls-cert tests/data/cert.pem --tls-key tests/data/key.pem --tls-port $((PORT + 1))
+mosquitto_sub -p $((PORT + 1)) --cafile tests/data/ca.pem -t tls/x -C 1 -W 3 > "$DIR/tls" & S=$!
+sleep 0.3
+pub -t tls/x -m "through TLS"
+wait $S
+check "TLS subscriber, TCP publisher" "through TLS" "$(cat "$DIR/tls")"
+sub -t tls/y -C 1 -W 3 > "$DIR/tls2" & S=$!
+sleep 0.3
+mosquitto_pub -p $((PORT + 1)) --cafile tests/data/ca.pem -t tls/y -q 1 -m "from TLS"
+wait $S
+check "TLS publisher, TCP subscriber" "from TLS" "$(cat "$DIR/tls2")"
+stop
+
 printf 'alice:wonder\n' > "$DIR/passwd"
 printf 'user alice\ntopic readwrite a/#\n' > "$DIR/acl"
 start --passwd "$DIR/passwd" --acl "$DIR/acl" --allow-anonymous false

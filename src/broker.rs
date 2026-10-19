@@ -29,6 +29,7 @@ use crate::auth::{self, Auth, Rule};
 use crate::codec::{self, Packet};
 use crate::index::{Entry, Sub, SubIndex};
 use crate::net;
+use crate::tls::{ServerConfig, Tls};
 
 const ROUTER: u32 = 0;
 const CONTEXT: u32 = 1;
@@ -417,6 +418,7 @@ const RECV: u64 = 1;
 const SEND: u64 = 2;
 const CLOSE: u64 = 3;
 const TIMER: u64 = 4;
+const ACCEPT_TLS: u64 = 5;
 
 /// Period of the connection tier's sweep (keep-alive and CONNECT timeouts).
 const TICK: Duration = Duration::from_secs(1);
@@ -497,6 +499,8 @@ struct Conn {
     held: Option<Vec<u8>>,
     /// Access rules, when the broker has an ACL.
     rules: Option<Box<[Rule]>>,
+    /// TLS state of a connection accepted on the TLS listener: `out` then holds plaintext.
+    tls: Option<Box<Tls>>,
     /// Bytes waiting to be sent. (The receive buffer is always owned by the recv in flight.)
     out: Vec<u8>,
     sending: bool,
@@ -508,6 +512,8 @@ struct Conn {
 pub struct Connections {
     topology: Arc<Topology>,
     listener: RawFd,
+    tls_listener: Option<RawFd>,
+    tls_config: Option<Arc<ServerConfig>>,
     timer: RawFd,
     tick: u32,
     connect_timeout: u32,
@@ -583,7 +589,17 @@ impl Connections {
         }
     }
 
-    fn accept(&mut self, ctx: &mut Context, fd: RawFd) {
+    fn accept(&mut self, ctx: &mut Context, fd: RawFd, tls: bool) {
+        let tls = match (tls, &self.tls_config) {
+            (true, Some(config)) => match Tls::new(config) {
+                Ok(t) => Some(t),
+                Err(_) => {
+                    ctx.io().unwrap().close(fd, token(CLOSE, 0));
+                    return;
+                }
+            },
+            _ => None,
+        };
         let index = self.free.pop().unwrap_or_else(|| {
             self.conns.push(None);
             self.generations.push(0);
@@ -602,6 +618,7 @@ impl Connections {
             session: None,
             held: None,
             rules: None,
+            tls,
             out: Vec::new(),
             sending: false,
             dirty: false,
@@ -691,38 +708,28 @@ impl Connections {
         }
         self.bytes_in += result as u64;
         let filled = buf.len() == buf.capacity();
-        let mut consumed = 0;
-        loop {
-            match codec::parse_limited(&buf[consumed..], self.max_packet) {
-                Ok(Some((packet, len))) => {
-                    consumed += len;
-                    match self.handle(ctx, id, packet) {
-                        Next::Continue => {}
-                        Next::Close => {
-                            self.close(ctx, id);
-                            return;
-                        }
-                        Next::WaitSession => {
-                            buf.drain(..consumed);
-                            self.get(id).unwrap().held = Some(buf);
-                            return;
-                        }
-                        Next::CloseAfterFlush => {
-                            // No more reads; `sent` closes once the output is out.
-                            self.get(id).unwrap().close_after_flush = true;
-                            self.mark_dirty(ctx, id);
-                            return;
-                        }
-                    }
-                }
-                Ok(None) => break,
-                Err(_) => {
-                    self.close(ctx, id);
-                    return;
-                }
+        let Some(conn) = self.get(id) else { return };
+        if let Some(mut tls) = conn.tls.take() {
+            // TLS: `buf` is ciphertext, the packets are parsed from the plaintext it carries.
+            if tls.receive(&buf).is_err() {
+                self.close(ctx, id);
+                return;
             }
+            buf.clear();
+            let mut plain = std::mem::take(&mut tls.plain);
+            let handshake = tls.wants_write();
+            conn.tls = Some(tls);
+            if handshake {
+                self.mark_dirty(ctx, id);
+            }
+            if !self.parse_all(ctx, id, &mut plain) {
+                return;
+            }
+            let Some(conn) = self.get(id) else { return };
+            conn.tls.as_mut().unwrap().plain = plain;
+        } else if !self.parse_all(ctx, id, &mut buf) {
+            return;
         }
-        buf.drain(..consumed);
         let cap = buf.capacity();
         let small = (result as usize) < cap / 8;
         let Some(conn) = self.get(id) else { return };
@@ -747,6 +754,65 @@ impl Connections {
         let Some(conn) = self.get(id) else { return };
         conn.last_rx = tick;
         let fd = conn.fd;
+        ctx.io().unwrap().recv(fd, buf, token(RECV, id));
+    }
+
+    /// Handles the complete packets at the start of `data` and removes them. False when the
+    /// connection stops reading: closed, closing, or waiting for its session (`data` is then
+    /// held).
+    fn parse_all(&mut self, ctx: &mut Context, id: u64, data: &mut Vec<u8>) -> bool {
+        let mut consumed = 0;
+        loop {
+            match codec::parse_limited(&data[consumed..], self.max_packet) {
+                Ok(Some((packet, len))) => {
+                    consumed += len;
+                    match self.handle(ctx, id, packet) {
+                        Next::Continue => {}
+                        Next::Close => {
+                            self.close(ctx, id);
+                            return false;
+                        }
+                        Next::WaitSession => {
+                            data.drain(..consumed);
+                            self.get(id).unwrap().held = Some(std::mem::take(data));
+                            return false;
+                        }
+                        Next::CloseAfterFlush => {
+                            // No more reads; `sent` closes once the output is out.
+                            self.get(id).unwrap().close_after_flush = true;
+                            self.mark_dirty(ctx, id);
+                            return false;
+                        }
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    self.close(ctx, id);
+                    return false;
+                }
+            }
+        }
+        data.drain(..consumed);
+        true
+    }
+
+    /// The session is open: handles what came after CONNECT, then reads resume.
+    fn resume(&mut self, ctx: &mut Context, id: u64, mut held: Vec<u8>) {
+        if !self.parse_all(ctx, id, &mut held) {
+            return;
+        }
+        let Some(conn) = self.get(id) else { return };
+        let fd = conn.fd;
+        let buf = match conn.tls.as_mut() {
+            Some(tls) => {
+                tls.plain = held;
+                Vec::with_capacity(RECV_MIN)
+            }
+            None => {
+                held.reserve(RECV_MIN);
+                held
+            }
+        };
         ctx.io().unwrap().recv(fd, buf, token(RECV, id));
     }
 
@@ -1095,16 +1161,41 @@ impl Connections {
             return;
         }
         conn.sending = false;
-        if conn.out.is_empty() {
-            if conn.close_after_flush {
-                self.close(ctx, id);
-                return;
+        match take_output(conn, buf) {
+            Ok(next) => {
+                conn.sending = true;
+                ctx.io().unwrap().send(fd, next, token(SEND, id));
             }
-            conn.out = buf; // keep the capacity
-        } else {
-            let next = std::mem::replace(&mut conn.out, buf);
-            conn.sending = true;
-            ctx.io().unwrap().send(fd, next, token(SEND, id));
+            Err(spare) => {
+                if conn.close_after_flush {
+                    self.close(ctx, id);
+                    return;
+                }
+                if conn.tls.is_none() {
+                    conn.out = spare; // keep the capacity
+                }
+            }
+        }
+    }
+}
+
+/// What connection `conn` has to send, in `spare` or in place of its output buffer (TLS:
+/// encrypted, with any handshake records); `Err(spare)` when there is nothing.
+fn take_output(conn: &mut Conn, mut spare: Vec<u8>) -> Result<Vec<u8>, Vec<u8>> {
+    match conn.tls.as_mut() {
+        None if conn.out.is_empty() => Err(spare),
+        None => Ok(std::mem::replace(&mut conn.out, spare)),
+        Some(tls) => {
+            if conn.out.is_empty() && !tls.wants_write() {
+                return Err(spare);
+            }
+            spare.clear();
+            let sent = tls.send(&conn.out, &mut spare);
+            conn.out.clear();
+            match sent {
+                Ok(()) if !spare.is_empty() => Ok(spare),
+                _ => Err(spare),
+            }
         }
     }
 }
@@ -1123,6 +1214,9 @@ impl Actor for Connections {
         self.contexts = Some(ctx.reference_local_actor::<Contexts>(contexts).expect("contexts on this core"));
         let mut io = ctx.io().expect("io_uring on broker cores");
         io.accept(self.listener, token(ACCEPT, 0));
+        if let Some(l) = self.tls_listener {
+            io.accept(l, token(ACCEPT_TLS, 0));
+        }
         io.read(self.timer, Vec::with_capacity(8), 0, token(TIMER, 0));
     }
 
@@ -1133,12 +1227,12 @@ impl Actor for Connections {
         for &id in &dirty {
             let Some(conn) = self.get(id) else { continue };
             conn.dirty = false;
-            if conn.sending || conn.out.is_empty() {
+            if conn.sending {
                 continue;
             }
+            let Ok(out) = take_output(conn, Vec::new()) else { continue };
             conn.sending = true;
             let fd = conn.fd;
-            let out = std::mem::take(&mut conn.out);
             ctx.io().unwrap().send(fd, out, token(SEND, id));
         }
         self.dirty = dirty;
@@ -1171,9 +1265,16 @@ impl Handler<IoCompletion> for Connections {
         match kind {
             ACCEPT => {
                 if c.result >= 0 {
-                    self.accept(ctx, c.result);
+                    self.accept(ctx, c.result, false);
                 }
                 ctx.io().unwrap().accept(self.listener, token(ACCEPT, 0));
+            }
+            ACCEPT_TLS => {
+                if c.result >= 0 {
+                    self.accept(ctx, c.result, true);
+                }
+                let l = self.tls_listener.unwrap();
+                ctx.io().unwrap().accept(l, token(ACCEPT_TLS, 0));
             }
             TIMER => {
                 self.sweep(ctx);
@@ -1276,7 +1377,7 @@ impl Handler<Opened> for Connections {
             }
         }
         self.mark_dirty(ctx, o.conn);
-        self.received(ctx, o.conn, 1, held); // what came after CONNECT, then reads resume
+        self.resume(ctx, o.conn, held);
     }
 }
 
@@ -1353,6 +1454,9 @@ pub struct Config {
     /// Bytes of messages a core may have sent to another and not seen handled; past that, QoS 0
     /// messages to that core are dropped.
     pub max_core_backlog: usize,
+    /// TLS listener on `tls_port`, with this configuration (see `tls::server_config`).
+    pub tls: Option<Arc<ServerConfig>>,
+    pub tls_port: u16,
 }
 
 impl Default for Config {
@@ -1369,6 +1473,8 @@ impl Default for Config {
             sys_interval: Duration::from_secs(10),
             auth: None,
             max_core_backlog: 16 << 20,
+            tls: None,
+            tls_port: 8883,
         }
     }
 }
@@ -1380,6 +1486,11 @@ pub fn start(config: &Config) -> std::io::Result<Engine> {
     let mut seq = StartSequence::new();
     for &core in &config.cores {
         let listener = net::reuseport_listener(config.ip, config.port, 4096)?;
+        let tls_listener = match config.tls {
+            Some(_) => Some(net::reuseport_listener(config.ip, config.tls_port, 4096)?),
+            None => None,
+        };
+        let tls_config = config.tls.clone();
         let timer = net::timerfd(TICK)?;
         let connect_timeout = config.connect_timeout.as_secs().max(1) as u32;
         let (max_packet, max_queued, max_inflight) = (config.max_packet, config.max_queued, config.max_inflight);
@@ -1403,6 +1514,8 @@ pub fn start(config: &Config) -> std::io::Result<Engine> {
         let n = seq.add_actor(core, move || Connections {
             topology: t,
             listener,
+            tls_listener,
+            tls_config,
             timer,
             tick: 0,
             connect_timeout,

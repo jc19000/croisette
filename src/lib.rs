@@ -6,3 +6,4 @@ pub mod client;
 pub mod codec;
 pub mod index;
 pub mod net;
+pub mod tls;

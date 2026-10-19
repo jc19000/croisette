@@ -850,3 +850,86 @@ fn credentials_and_acl_are_enforced() {
     assert_nothing(&mut admin);
     engine.shutdown();
 }
+
+// ---- TLS ----------------------------------------------------------------------------------------
+
+type TlsStream = rustls::StreamOwned<rustls::ClientConnection, TcpStream>;
+
+fn tls_connect(addr: SocketAddr) -> TlsStream {
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in rustls_pemfile::certs(&mut &include_bytes!("data/ca.pem")[..]) {
+        roots.add(cert.unwrap()).unwrap();
+    }
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let conn = rustls::ClientConnection::new(std::sync::Arc::new(config), name).unwrap();
+    let tcp = TcpStream::connect(addr).unwrap();
+    tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    rustls::StreamOwned::new(conn, tcp)
+}
+
+/// Reads packets until one PUBLISH, answering nothing (QoS 0 subscriptions).
+fn tls_next_publish(s: &mut TlsStream, buf: &mut Vec<u8>) -> (String, Vec<u8>) {
+    loop {
+        if let Some((p, len)) = codec::parse(buf).unwrap() {
+            let got = match p {
+                codec::Packet::Publish { topic, payload, .. } => Some((topic.to_string(), payload.to_vec())),
+                _ => None,
+            };
+            buf.drain(..len);
+            if let Some(g) = got {
+                return g;
+            }
+            continue;
+        }
+        let mut chunk = [0u8; 16384];
+        let n = s.read(&mut chunk).unwrap();
+        assert!(n > 0, "closed");
+        buf.extend_from_slice(&chunk[..n]);
+    }
+}
+
+#[test]
+fn tls_clients_talk_with_tcp_clients() {
+    let _g = serial();
+    let tls = croisette::tls::server_config_from_pem(include_bytes!("data/cert.pem"), include_bytes!("data/key.pem"))
+        .unwrap();
+    let tls_port = free_port();
+    let (engine, addr) = start_with(Config { cores: vec![1, 2], tls: Some(tls), tls_port, ..Config::default() });
+    let tls_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, tls_port));
+    // TLS subscriber, TCP publisher.
+    let mut sub = tls_connect(tls_addr);
+    let mut b = Vec::new();
+    codec::connect(&mut b, "tls-sub", 60, true);
+    codec::subscribe(&mut b, 1, &[("secure/#", 0)]);
+    sub.write_all(&b).unwrap();
+    let mut rx = Vec::new();
+    std::thread::sleep(Duration::from_millis(200));
+    let mut p = client(addr, "p");
+    let big: Vec<u8> = (0..100_000u32).map(|i| i as u8).collect();
+    p.publish("secure/a", b"hello", 1, false).unwrap();
+    p.publish("secure/big", &big, 1, false).unwrap();
+    assert_eq!(tls_next_publish(&mut sub, &mut rx), ("secure/a".into(), b"hello".to_vec()));
+    assert_eq!(tls_next_publish(&mut sub, &mut rx), ("secure/big".into(), big.clone()));
+    // TLS publisher, TCP subscriber.
+    let mut s = client(addr, "s");
+    s.subscribe(&["from/tls"]).unwrap();
+    let mut publ = tls_connect(tls_addr);
+    let mut b = Vec::new();
+    codec::connect(&mut b, "tls-pub", 60, true);
+    codec::publish(&mut b, "from/tls", &big, 0, false, None);
+    publ.write_all(&b).unwrap();
+    assert_eq!(s.next_publish().unwrap(), publish_msg("from/tls", &big));
+    // Plain MQTT on the TLS port is not TLS: closed.
+    let mut raw = TcpStream::connect(tls_addr).unwrap();
+    let mut b = Vec::new();
+    codec::connect(&mut b, "confused", 60, true);
+    raw.write_all(&b).unwrap();
+    assert_closed_by_broker(&mut raw, Duration::from_secs(2));
+    engine.shutdown();
+}
