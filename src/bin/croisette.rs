@@ -3,7 +3,7 @@
 //! usage: croisette [--port 1883] [--cores 1,2] [--mode MODE] [--max-queued BYTES]
 //!        [--max-packet BYTES] [--max-inflight MESSAGES] [--connect-timeout SECONDS]
 //!        [--sys-interval SECONDS] [--passwd FILE] [--acl FILE] [--allow-anonymous true|false]
-//!        [--tls-cert PEM --tls-key PEM [--tls-port 8883]]
+//!        [--tls-cert PEM --tls-key PEM [--tls-port 8883]] [--persist-dir DIR [--autosave SECONDS]]
 //!        croisette hash-password USER PASSWORD     (prints a password file line)
 //!
 //! MODE: `spin`, `adaptive` (2000 idle loops, then 50 µs sleeps), `adaptive:<loops>:<µs>`,
@@ -59,6 +59,8 @@ fn main() {
             "--tls-cert" => tls_cert = Some(PathBuf::from(value)),
             "--tls-key" => tls_key = Some(PathBuf::from(value)),
             "--tls-port" => config.tls_port = value.parse().expect("port"),
+            "--persist-dir" => config.persist_dir = Some(PathBuf::from(value)),
+            "--autosave" => config.autosave = Duration::from_secs(value.parse().expect("seconds")),
             "--acl" => acl = Some(PathBuf::from(value)),
             "--allow-anonymous" => anonymous = value.parse().expect("true or false"),
             other => panic!("unknown option {other}"),
@@ -82,10 +84,11 @@ fn main() {
         (None, None) => {}
         _ => panic!("--tls-cert and --tls-key go together"),
     }
-    let _engine = broker::start(&config).expect("broker start");
+    croisette::net::block_termination_signals();
+    let engine = broker::start(&config).expect("broker start");
     let tls = config.tls.as_ref().map(|_| format!(", TLS on port {}", config.tls_port)).unwrap_or_default();
     eprintln!("croisette listening on port {}{tls} on cores {:?} ({:?})", config.port, config.cores, config.mode);
-    loop {
-        std::thread::park();
-    }
+    let sig = croisette::net::wait_for_termination();
+    eprintln!("croisette: signal {sig}, stopping");
+    engine.shutdown(); // closes the connections and writes the snapshots
 }

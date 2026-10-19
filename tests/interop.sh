@@ -72,6 +72,16 @@ wait $S
 check "TLS publisher, TCP subscriber" "from TLS" "$(cat "$DIR/tls2")"
 stop
 
+start --persist-dir "$DIR/db"
+pub -t keep/me -r -q 1 -m persisted
+sub -t "later/#" -q 1 -c -i keeper -C 1 -W 1 > /dev/null # a persistent session, offline
+pub -t later/x -q 1 -m "queued before restart"
+stop # SIGTERM: snapshots written
+start --persist-dir "$DIR/db"
+check "retained message after restart" "persisted" "$(sub -t 'keep/#' -C 1 -W 3)"
+check "session queue after restart" "queued before restart" "$(sub -t 'later/#' -q 1 -c -i keeper -C 1 -W 3)"
+stop
+
 printf 'alice:wonder\n' > "$DIR/passwd"
 printf 'user alice\ntopic readwrite a/#\n' > "$DIR/acl"
 start --passwd "$DIR/passwd" --acl "$DIR/acl" --allow-anonymous false

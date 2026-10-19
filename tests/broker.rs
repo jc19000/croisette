@@ -933,3 +933,58 @@ fn tls_clients_talk_with_tcp_clients() {
     assert_closed_by_broker(&mut raw, Duration::from_secs(2));
     engine.shutdown();
 }
+
+// ---- Persistence --------------------------------------------------------------------------------
+
+#[test]
+fn retained_and_sessions_survive_a_restart() {
+    let _g = serial();
+    let dir = std::env::temp_dir().join(format!("croisette-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let config = |cores: Vec<usize>| Config {
+        cores,
+        persist_dir: Some(dir.clone()),
+        autosave: Duration::from_secs(1),
+        ..Config::default()
+    };
+    let (engine, addr) = start_with(config(vec![1, 2]));
+    let (mut dev, _) = persistent(addr, "dev");
+    dev.subscribe_qos(&["p/#"], 1).unwrap();
+    dev.disconnect().unwrap();
+    let (mut online, _) = persistent(addr, "online");
+    online.subscribe_qos(&["o/#"], 1).unwrap(); // stays connected until the broker stops
+    let mut p = client(addr, "p");
+    p.publish("r/x", b"kept", 1, true).unwrap();
+    p.publish("p/a", b"queued", 1, false).unwrap();
+    // The periodic snapshot has the retained message.
+    std::thread::sleep(Duration::from_millis(2500));
+    let (saved, _) = croisette::persist::load_dir(&dir).unwrap();
+    assert!(saved.retained.iter().any(|r| r.0 == "r/x"), "{saved:?}");
+    engine.shutdown(); // writes the final snapshots
+    drop((p, online));
+
+    // Restart on one core: the partitions are redistributed.
+    let (engine, addr) = start_with(config(vec![1]));
+    let mut s = client(addr, "s");
+    s.subscribe(&["r/#"]).unwrap();
+    assert_eq!(
+        s.next_publish().unwrap(),
+        Incoming::Publish { topic: "r/x".into(), payload: b"kept".to_vec(), qos: 0, retain: true }
+    );
+    let mut p = client(addr, "p");
+    p.publish("p/b", b"after restart", 1, false).unwrap(); // routed to the restored session
+    p.publish("o/a", b"for online", 1, false).unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    let (mut dev, present) = persistent(addr, "dev");
+    assert!(present);
+    assert_eq!(dev.next_publish().unwrap(), qos1_msg("p/a", b"queued", false));
+    assert_eq!(dev.next_publish().unwrap(), qos1_msg("p/b", b"after restart", false));
+    let (mut online, present) = persistent(addr, "online");
+    assert!(present, "online sessions are saved with their subscriptions");
+    assert_eq!(online.next_publish().unwrap(), qos1_msg("o/a", b"for online", false));
+    engine.shutdown();
+    let names: Vec<String> =
+        std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+    assert_eq!(names, vec!["partition-1.db".to_string()], "the old partition is gone");
+    std::fs::remove_dir_all(&dir).unwrap();
+}

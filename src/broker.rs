@@ -19,7 +19,8 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::Ipv4Addr;
-use std::os::fd::RawFd;
+use std::os::fd::{FromRawFd, IntoRawFd, RawFd};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -29,6 +30,7 @@ use crate::auth::{self, Auth, Rule};
 use crate::codec::{self, Packet};
 use crate::index::{Entry, Sub, SubIndex};
 use crate::net;
+use crate::persist::{self, Saved, SavedSession};
 use crate::tls::{ServerConfig, Tls};
 
 const ROUTER: u32 = 0;
@@ -131,6 +133,13 @@ struct Undelivered {
     received: Vec<u16>,
 }
 
+/// connection -> context: the subscriptions of an online persistent session changed (kept for
+/// snapshots).
+struct SessionFilters {
+    client_id: Box<str>,
+    filters: Vec<(Box<str>, u8)>,
+}
+
 /// connection -> context: a clean-session connection with a client id closed.
 struct Unregister {
     client_id: Box<str>,
@@ -200,6 +209,10 @@ pub struct Contexts {
     sessions: HashMap<u32, Session>,
     next_sid: u32,
     max_queued: usize,
+    /// Snapshot directory (see `persist`).
+    persist: Option<PathBuf>,
+    /// Sessions restored from a snapshot, whose session targets are not in the routers yet.
+    restored: Vec<u32>,
 }
 
 /// A client id's session, on the context partition of the client id.
@@ -236,6 +249,90 @@ impl Actor for Contexts {
         ctx.register_handler::<Open, Self>();
         ctx.register_handler::<Unregister, Self>();
         ctx.register_handler::<Park, Self>();
+        ctx.register_handler::<SessionFilters, Self>();
+        if !self.restored.is_empty() {
+            ctx.register_callback(); // events go out once the engine runs
+        }
+    }
+
+    /// First iteration after a restore: the offline sessions' subscriptions route to them.
+    fn on_callback(&mut self, ctx: &mut Context) {
+        for sid in std::mem::take(&mut self.restored) {
+            let Some(s) = self.sessions.get(&sid) else { continue };
+            let target = (ctx.core() as u16, SESSION | sid as u64);
+            for (filter, qos) in &s.filters {
+                for &core in &self.topology.cores {
+                    ctx.send(actor(core, ROUTER), SubAdd { filter: filter.clone(), sub: target, qos: *qos });
+                }
+            }
+        }
+    }
+
+    fn on_destroy_request(&mut self, ctx: &mut Context) -> bool {
+        if let Some(dir) = &self.persist {
+            let path = persist::partition_file(dir, ctx.core());
+            if let Err(e) = persist::write_atomic(&path, &persist::encode(&self.snapshot())) {
+                eprintln!("croisette: cannot save {}: {e}", path.display());
+            }
+        }
+        true
+    }
+}
+
+impl Contexts {
+    /// Retained messages and persistent sessions, for a snapshot. Online sessions are saved
+    /// with their subscriptions only.
+    pub fn snapshot(&self) -> Saved {
+        let retained = self.retained.iter().map(|(t, (p, q))| (t.to_string(), p.clone(), *q)).collect();
+        let sessions = self
+            .sessions
+            .values()
+            .filter(|s| s.persistent)
+            .map(|s| SavedSession {
+                client_id: s.client_id.to_string(),
+                filters: s.filters.iter().map(|(f, q)| (f.to_string(), *q)).collect(),
+                inflight: s.undelivered.inflight.clone(),
+                queue: s.undelivered.queue.iter().cloned().collect(),
+                received: s.undelivered.received.clone(),
+            })
+            .collect();
+        Saved { retained, sessions }
+    }
+
+    /// Restores a snapshot: retained messages, and persistent sessions, offline.
+    fn restore(&mut self, saved: Saved) {
+        for (topic, payload, qos) in saved.retained {
+            self.retained.insert(topic.into(), (payload, qos));
+        }
+        for x in saved.sessions {
+            let sid = self.next_sid;
+            self.next_sid += 1;
+            let queue: VecDeque<(u8, Vec<u8>)> = x.queue.into();
+            let queued_bytes = queue.iter().map(|q| q.1.len()).sum();
+            self.by_client.insert(x.client_id.as_str().into(), sid);
+            self.sessions.insert(
+                sid,
+                Session {
+                    client_id: x.client_id.into(),
+                    persistent: true,
+                    state: SessionState::Offline,
+                    filters: x.filters.into_iter().map(|(f, q)| (f.into(), q)).collect(),
+                    undelivered: Undelivered { inflight: x.inflight, queue, received: x.received },
+                    queued_bytes,
+                },
+            );
+            self.restored.push(sid);
+        }
+    }
+}
+
+impl Handler<SessionFilters> for Contexts {
+    fn on_event(&mut self, _ctx: &mut Context, _src: ActorId, f: &SessionFilters) {
+        let Some(sid) = self.by_client.get(&f.client_id) else { return };
+        let s = self.sessions.get_mut(sid).unwrap();
+        if matches!(s.state, SessionState::Online(_)) {
+            s.filters = f.filters.clone();
+        }
     }
 }
 
@@ -419,6 +516,7 @@ const SEND: u64 = 2;
 const CLOSE: u64 = 3;
 const TIMER: u64 = 4;
 const ACCEPT_TLS: u64 = 5;
+const SAVE: u64 = 6;
 
 /// Period of the connection tier's sweep (keep-alive and CONNECT timeouts).
 const TICK: Duration = Duration::from_secs(1);
@@ -546,6 +644,10 @@ pub struct Connections {
     /// By core: `Deliver` bytes received from it, acknowledged at the end of the iteration.
     consumed_from: Vec<usize>,
     max_core_backlog: usize,
+    /// Snapshot directory and period in ticks, and the snapshot file being written.
+    persist: Option<PathBuf>,
+    autosave: u32,
+    saving: Option<RawFd>,
     conns: Vec<Option<Conn>>,
     generations: Vec<u32>,
     free: Vec<u32>,
@@ -816,6 +918,48 @@ impl Connections {
         ctx.io().unwrap().recv(fd, buf, token(RECV, id));
     }
 
+    /// Writes this core's context partition to a new snapshot file with io_uring; renamed over
+    /// the previous one when the write completes.
+    fn save(&mut self, ctx: &mut Context) {
+        let Some(dir) = &self.persist else { return };
+        let tmp = persist::partition_file(dir, ctx.core()).with_extension("tmp");
+        let data = persist::encode(&self.contexts.as_ref().unwrap().borrow().snapshot());
+        match std::fs::File::create(&tmp) {
+            Ok(f) => {
+                let fd = f.into_raw_fd();
+                self.saving = Some(fd);
+                ctx.io().unwrap().write(fd, data, 0, token(SAVE, 0));
+            }
+            Err(e) => eprintln!("croisette: cannot save {}: {e}", tmp.display()),
+        }
+    }
+
+    fn saved(&mut self, ctx: &mut Context, result: i32, len: usize) {
+        let Some(fd) = self.saving.take() else { return };
+        drop(unsafe { std::fs::File::from_raw_fd(fd) });
+        let Some(dir) = &self.persist else { return };
+        let path = persist::partition_file(dir, ctx.core());
+        let tmp = path.with_extension("tmp");
+        if result < 0 || result as usize != len {
+            eprintln!("croisette: snapshot write failed ({result}), {} kept", path.display());
+        } else if let Err(e) = std::fs::rename(&tmp, &path) {
+            eprintln!("croisette: cannot save {}: {e}", path.display());
+        }
+    }
+
+    /// The subscriptions of an online persistent session go to its context partition, which
+    /// saves them in snapshots.
+    fn sync_session_filters(&mut self, ctx: &mut Context, id: u64) {
+        if self.persist.is_none() {
+            return;
+        }
+        let Some(conn) = self.get(id) else { return };
+        let (true, Some(_), Some(client_id)) = (conn.persistent, conn.session, &conn.client_id) else { return };
+        let msg = SessionFilters { client_id: client_id.clone(), filters: conn.filters.clone() };
+        let partition = self.topology.partition(&msg.client_id);
+        ctx.send(actor(partition, CONTEXT), msg);
+    }
+
     /// Once per `TICK`: closes connections silent for 1.5 keep-alive periods, and connections
     /// that did not send CONNECT in time.
     fn sweep(&mut self, ctx: &mut Context) {
@@ -838,6 +982,9 @@ impl Connections {
             self.close(ctx, id);
         }
         self.forwards.retain(|_, f| tick.wrapping_sub(f.2) <= 2);
+        if self.autosave > 0 && tick % self.autosave == 0 && self.saving.is_none() {
+            self.save(ctx);
+        }
         if self.sys_interval > 0 && tick % self.sys_interval == 0 {
             let (retained, sessions) = {
                 let c = self.contexts.as_ref().unwrap().borrow();
@@ -971,6 +1118,7 @@ impl Connections {
                 }
                 codec::suback(&mut conn.out, packet_id, &granted);
                 self.mark_dirty(ctx, id);
+                self.sync_session_filters(ctx, id);
             }
             Packet::Unsubscribe { packet_id, filters } => {
                 let sub = (core, id);
@@ -981,6 +1129,7 @@ impl Connections {
                 conn.filters.retain(|(f, _)| !filters.contains(&&**f));
                 codec::unsuback(&mut conn.out, packet_id);
                 self.mark_dirty(ctx, id);
+                self.sync_session_filters(ctx, id);
             }
             Packet::PingReq => {
                 codec::pingresp(&mut self.get(id).unwrap().out);
@@ -1276,6 +1425,10 @@ impl Handler<IoCompletion> for Connections {
                 let l = self.tls_listener.unwrap();
                 ctx.io().unwrap().accept(l, token(ACCEPT_TLS, 0));
             }
+            SAVE => {
+                let len = c.take_buf().map_or(0, |b| b.len());
+                self.saved(ctx, c.result, len);
+            }
             TIMER => {
                 self.sweep(ctx);
                 let timer = self.timer;
@@ -1457,6 +1610,10 @@ pub struct Config {
     /// TLS listener on `tls_port`, with this configuration (see `tls::server_config`).
     pub tls: Option<Arc<ServerConfig>>,
     pub tls_port: u16,
+    /// Snapshot directory for retained messages and persistent sessions (none: memory only),
+    /// and the period of the snapshots (also written at shutdown).
+    pub persist_dir: Option<PathBuf>,
+    pub autosave: Duration,
 }
 
 impl Default for Config {
@@ -1475,6 +1632,8 @@ impl Default for Config {
             max_core_backlog: 16 << 20,
             tls: None,
             tls_port: 8883,
+            persist_dir: None,
+            autosave: Duration::from_secs(30),
         }
     }
 }
@@ -1483,8 +1642,13 @@ impl Default for Config {
 /// tier with its own SO_REUSEPORT listener and io_uring.
 pub fn start(config: &Config) -> std::io::Result<Engine> {
     let topology = Arc::new(Topology { cores: config.cores.clone() });
+    let mut restored = restore(config, &topology)?;
     let mut seq = StartSequence::new();
     for &core in &config.cores {
+        let saved = std::mem::take(&mut restored[topology.cores.iter().position(|&c| c == core).unwrap()]);
+        let persist_dir = config.persist_dir.clone();
+        let persist_dir2 = config.persist_dir.clone();
+        let autosave = if config.persist_dir.is_some() { config.autosave.as_secs().max(1) as u32 } else { 0 };
         let listener = net::reuseport_listener(config.ip, config.port, 4096)?;
         let tls_listener = match config.tls {
             Some(_) => Some(net::reuseport_listener(config.ip, config.tls_port, 4096)?),
@@ -1502,13 +1666,19 @@ pub fn start(config: &Config) -> std::io::Result<Engine> {
         // Added in this order on every core, so that their ids are known up front.
         let r = seq.add_actor(core, || Router { index: SubIndex::new() });
         let t = topology.clone();
-        let c = seq.add_actor(core, move || Contexts {
-            topology: t,
-            retained: HashMap::new(),
-            by_client: HashMap::new(),
-            sessions: HashMap::new(),
-            next_sid: 0,
-            max_queued,
+        let c = seq.add_actor(core, move || {
+            let mut c = Contexts {
+                topology: t,
+                retained: HashMap::new(),
+                by_client: HashMap::new(),
+                sessions: HashMap::new(),
+                next_sid: 0,
+                max_queued,
+                persist: persist_dir,
+                restored: Vec::new(),
+            };
+            c.restore(saved);
+            c
         });
         let t = topology.clone();
         let n = seq.add_actor(core, move || Connections {
@@ -1537,6 +1707,9 @@ pub fn start(config: &Config) -> std::io::Result<Engine> {
             unacked_to: Vec::new(),
             consumed_from: Vec::new(),
             max_core_backlog,
+            persist: persist_dir2,
+            autosave,
+            saving: None,
             conns: Vec::new(),
             generations: Vec::new(),
             free: Vec::new(),
@@ -1549,6 +1722,32 @@ pub fn start(config: &Config) -> std::io::Result<Engine> {
         assert_eq!((r, c, n), (actor(core, ROUTER), actor(core, CONTEXT), actor(core, CONNECTIONS)));
     }
     Ok(Engine::start(seq))
+}
+
+/// Reads the snapshots of `persist_dir`, and splits their entries over the partitions of the
+/// current cores (by index in `topology.cores`). The split is written back at once and older
+/// files are removed, so that a change in the number of cores is picked up whole.
+fn restore(config: &Config, topology: &Topology) -> std::io::Result<Vec<Saved>> {
+    let mut parts: Vec<Saved> = topology.cores.iter().map(|_| Saved::default()).collect();
+    let Some(dir) = &config.persist_dir else { return Ok(parts) };
+    let (saved, paths) = persist::load_dir(dir)?;
+    let index = |key: &str| topology.cores.iter().position(|&c| c == topology.partition(key)).unwrap();
+    for r in saved.retained {
+        parts[index(&r.0)].retained.push(r);
+    }
+    for x in saved.sessions {
+        parts[index(&x.client_id)].sessions.push(x);
+    }
+    let mut written = Vec::new();
+    for (i, &core) in topology.cores.iter().enumerate() {
+        let path = persist::partition_file(dir, core);
+        persist::write_atomic(&path, &persist::encode(&parts[i]))?;
+        written.push(path);
+    }
+    for p in paths.iter().filter(|p| !written.contains(p)) {
+        std::fs::remove_file(p)?;
+    }
+    Ok(parts)
 }
 
 /// The adaptive idle mode used for "efficient" runs: spin while traffic flows, sleep after

@@ -1,5 +1,5 @@
 //! The few system calls std does not offer: SO_REUSEPORT listeners, TCP_NODELAY and shutdown
-//! on raw fds, timerfd.
+//! on raw fds, timerfd, termination signals.
 
 use std::io;
 use std::net::Ipv4Addr;
@@ -26,6 +26,9 @@ struct ITimerSpec {
     value: TimeSpec,
 }
 
+#[repr(C)]
+struct SigSet([u64; 16]);
+
 extern "C" {
     fn socket(domain: i32, ty: i32, protocol: i32) -> i32;
     fn setsockopt(fd: i32, level: i32, name: i32, value: *const i32, len: u32) -> i32;
@@ -34,6 +37,10 @@ extern "C" {
     fn close(fd: i32) -> i32;
     fn timerfd_create(clock: i32, flags: i32) -> i32;
     fn timerfd_settime(fd: i32, flags: i32, new: *const ITimerSpec, old: *mut ITimerSpec) -> i32;
+    fn sigemptyset(set: *mut SigSet) -> i32;
+    fn sigaddset(set: *mut SigSet, sig: i32) -> i32;
+    fn pthread_sigmask(how: i32, set: *const SigSet, old: *mut SigSet) -> i32;
+    fn sigwait(set: *const SigSet, sig: *mut i32) -> i32;
     #[link_name = "shutdown"]
     fn shutdown_fd(fd: i32, how: i32) -> i32;
 }
@@ -102,4 +109,32 @@ pub fn timerfd(period: Duration) -> io::Result<RawFd> {
         return Err(e);
     }
     Ok(fd)
+}
+
+fn termination_signals() -> SigSet {
+    const SIGINT: i32 = 2;
+    const SIGTERM: i32 = 15;
+    let mut set = SigSet([0; 16]);
+    unsafe {
+        sigemptyset(&mut set);
+        sigaddset(&mut set, SIGINT);
+        sigaddset(&mut set, SIGTERM);
+    }
+    set
+}
+
+/// Blocks SIGINT and SIGTERM in the calling thread and the threads it starts afterwards, so that
+/// `wait_for_termination` receives them. Call before starting the engine.
+pub fn block_termination_signals() {
+    const SIG_BLOCK: i32 = 0;
+    let set = termination_signals();
+    unsafe { pthread_sigmask(SIG_BLOCK, &set, std::ptr::null_mut()) };
+}
+
+/// Waits for SIGINT or SIGTERM; returns its number.
+pub fn wait_for_termination() -> i32 {
+    let set = termination_signals();
+    let mut sig = 0;
+    unsafe { sigwait(&set, &mut sig) };
+    sig
 }
