@@ -76,7 +76,9 @@ fn main() {
         broker::adaptive()
     });
     match (tls_cert, tls_key) {
-        (Some(cert), Some(key)) => config.tls = Some(croisette::tls::server_config(&cert, &key).expect("TLS certificate")),
+        (Some(cert), Some(key)) => {
+            config.tls = Some(croisette::tls::server_config(&cert, &key).expect("TLS certificate"))
+        }
         (None, None) => {}
         _ => panic!("--tls-cert and --tls-key go together"),
     }

@@ -5,12 +5,13 @@ actor engine, with io_uring for the network. It is benchmarked against Mosquitto
 same machine and the same load.
 
 **Result in one line:** with one core each, croisette sustains about **12x (fan-in), 14x
-(fan-out) and 7x (QoS 1) the message rate** of Mosquitto before saturating. At loads both brokers
+(fan-out) and 7x (QoS 1) the message rate** of Mosquitto before saturating, and 5x to 8x over
+TLS. At loads both brokers
 handle, croisette uses 20 to 50 % less CPU and has lower tail latency. When idle, both use about
 0.001 core. Memory per idle connection is 0.93 KB, against 0.78 KB for Mosquitto.
 
-Status: feature-complete for MQTT 3.1.1 without TLS and without persistence to disk (see
-[Scope](#scope)). It has not been run in production.
+Status: MQTT 3.1.1 with TLS, without persistence to disk (see [Scope](#scope)). It has not been
+run in production.
 
 ```sh
 cargo run --release --bin croisette -- --port 1883 --cores 1,2
@@ -89,14 +90,17 @@ before every replica saw it close are forwarded to its session.
     dropped and counted, so it neither grows the broker's memory nor slows the others;
   - `max_core_backlog` bytes between two cores: the same for a core slower than its senders.
 
-**Not implemented:** TLS, persistence to disk (sessions and retained messages live in memory),
+**TLS:** a TLS listener with rustls (`--tls-cert`, `--tls-key`, `--tls-port`, default 8883),
+alongside the TCP one.
+
+**Not implemented:** persistence to disk (sessions and retained messages live in memory),
 MQTT 5, bridges, WebSockets.
 
 **Tests:**
 
-- `tests/broker.rs`: 27 end-to-end tests with real TCP clients on two cores.
+- `tests/broker.rs`: 28 end-to-end tests with real TCP and TLS clients on two cores.
 - Unit tests for the codec, the index and authentication.
-- `tests/interop.sh`: 12 checks with `mosquitto_pub` / `mosquitto_sub`.
+- `tests/interop.sh`: 14 checks with `mosquitto_pub` / `mosquitto_sub`, TLS included.
 
 ### Options
 
@@ -104,6 +108,7 @@ MQTT 5, bridges, WebSockets.
 croisette [--port 1883] [--cores 1,2] [--mode MODE] [--max-queued BYTES] [--max-packet BYTES]
           [--max-inflight N] [--connect-timeout S] [--sys-interval S]
           [--passwd FILE] [--acl FILE] [--allow-anonymous true|false]
+          [--tls-cert PEM --tls-key PEM [--tls-port 8883]]
 croisette hash-password USER PASSWORD
 ```
 
@@ -187,6 +192,26 @@ The publish rate is multiplied by 50: deliveries = 50 × publishes.
 Mosquitto saturates at about 26k QoS 1 msg/s. croisette sustains 200k msg/s, and at 20k msg/s
 it uses 27 % less CPU with a p99 four times lower.
 
+### TLS: the same loads over TLS 1.3, QoS 0, one broker core
+
+Mosquitto uses `bench/mosquitto-tls.conf`; croisette runs with `--tls-cert` / `--tls-key`. Both
+use the test certificate in `tests/data`. The load generator speaks TLS with rustls.
+
+| Load | Mosquitto delivered | CPU | p50 / p99 | croisette delivered | CPU | p50 / p99 |
+|---|---:|---:|---|---:|---:|---|
+| fan-in 20 000 msg/s | 20 026 | 0.52 | 62 µs / 2.5 ms | 20 029 | **0.33** | 46 µs / 1.4 ms |
+| fan-in 50 000 msg/s | 50 147 | 0.94 | 298 µs / 28 ms | 50 149 | 0.58 | 45 µs / 2.8 ms |
+| fan-in 100 000 msg/s | **59 987 (saturated)** | 0.98 | >100 ms | 100 173 | 0.83 | 64 µs / 1.4 ms |
+| fan-in 200 000 msg/s | 55 653 | 0.98 | >100 ms | 200 283 | 0.97 | 175 µs / 2.7 ms |
+| fan-in 500 000 msg/s | 61 440 | 0.97 | >100 ms | 500 295 | 0.95 | 200 µs / 7.6 ms |
+| fan-out 1 000 → 51 200/s | 51 198 | 0.58 | 775 µs / 11 ms | 51 193 | **0.31** | 495 µs / 8.9 ms |
+| fan-out 4 000 → 200 000/s | **99 008 (saturated)** | 0.98 | >100 ms | 199 867 | 0.77 | 682 µs / 3.3 ms |
+| fan-out 10 000 → 500 000/s | 92 956 | 0.99 | >100 ms | 498 109 | 0.94 | 707 µs / 3.4 ms |
+
+TLS costs both brokers. The gap stays at about 8x in fan-in and 5x in fan-out, because croisette
+encrypts each connection's batch of messages as a few records per loop iteration, while Mosquitto
+encrypts message by message. Raw rows are in `bench/results-tls.txt`.
+
 ### Idle: 10 000 connections that send nothing
 
 | | Mosquitto | croisette (default) | croisette `spin` | croisette 2 cores `adaptive` |
@@ -230,7 +255,6 @@ QoS 1. For the same traffic, that is roughly an order of magnitude fewer broker 
 same protocol and the same clients. When idle, croisette costs no more CPU than Mosquitto and
 about 20 % more memory per connection.
 
-**Caveats:**
+With TLS, the ratio is about 8x in fan-in and 5x in fan-out.
 
-- TLS is not implemented yet. It adds CPU per message to every broker and would narrow the gap.
-- The results come from one VM over loopback.
+**Caveat:** the results come from one VM over loopback.

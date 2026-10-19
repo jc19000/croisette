@@ -12,7 +12,7 @@
 //! `schedstat` of all its threads, memory from `VmRSS`.
 //!
 //! usage: croisette-bench flow|idle --port P --broker-pid PID [--pubs N] [--subs N] [--rate R]
-//!        [--secs S] [--payload B] [--filter F] [--threads T] [--qos Q] [--conns N]
+//!        [--secs S] [--payload B] [--filter F] [--threads T] [--qos Q] [--conns N] [--tls CA_FILE]
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -112,9 +112,16 @@ impl Args {
     }
 }
 
+/// `--tls CA_FILE`: connect over TLS, trusting that CA, to a certificate for `localhost`.
+static TLS: OnceLock<Arc<croisette::client::ClientConfig>> = OnceLock::new();
+
 fn connect_retry(addr: SocketAddr, id: &str) -> Client {
     for _ in 0..50 {
-        if let Ok(c) = Client::connect(addr, id) {
+        let c = match TLS.get() {
+            Some(config) => Client::connect_tls(addr, id, config.clone(), "localhost"),
+            None => Client::connect(addr, id),
+        };
+        if let Ok(c) = c {
             return c;
         }
         thread::sleep(Duration::from_millis(20));
@@ -134,6 +141,7 @@ fn flow(args: &Args, addr: SocketAddr, pid: u32) {
     let filter = args.string("filter", "bench/#");
     let threads: usize = args.get("threads", 1);
     let qos: u8 = args.get("qos", 0);
+    assert!(qos == 0 || TLS.get().is_none(), "--tls: QoS 0 only");
 
     // Subscribers first, each subscribed before anyone publishes.
     let sub_clients: Vec<Client> = (0..subs)
@@ -199,7 +207,7 @@ fn flow(args: &Args, addr: SocketAddr, pid: u32) {
                     .map(|i| (connect_retry(addr, &format!("bench-pub-{i}")), format!("bench/{i}")))
                     .collect();
                 // PUBACKs of QoS 1 publishes are read and dropped by a helper thread.
-                for (c, _) in &clients {
+                for (c, _) in clients.iter().filter(|_| qos > 0) {
                     let mut acks = c.stream.try_clone().unwrap();
                     thread::spawn(move || {
                         let mut b = [0u8; 4096];
@@ -324,6 +332,10 @@ fn main() {
     let args = Args::parse();
     let port: u16 = args.get("port", 1883);
     let pid: u32 = args.get("broker-pid", 0);
+    if let Some(ca) = args.opts.get("tls") {
+        let pem = std::fs::read(ca).expect("--tls CA file");
+        TLS.set(croisette::client::tls_config(&pem).expect("CA certificates")).ok();
+    }
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     now_ns();
     match args.scenario.as_str() {

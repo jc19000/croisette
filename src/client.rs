@@ -2,7 +2,10 @@
 
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::sync::Arc;
 use std::time::Duration;
+
+pub use rustls::ClientConfig;
 
 use crate::codec::{self, Connect, Packet};
 
@@ -21,6 +24,23 @@ pub struct Client {
     pub last_dup: bool,
     /// Ids of QoS 2 messages received and not released by the broker yet.
     qos2: Vec<u16>,
+    /// TLS over `stream`, if connected with `connect_tls`.
+    tls: Option<Box<rustls::ClientConnection>>,
+}
+
+/// A TLS client configuration trusting the CA certificates of a PEM file's contents.
+pub fn tls_config(ca_pem: &[u8]) -> io::Result<Arc<ClientConfig>> {
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in rustls_pemfile::certs(&mut &ca_pem[..]) {
+        roots.add(cert?).map_err(io::Error::other)?;
+    }
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(io::Error::other)?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Ok(Arc::new(config))
 }
 
 /// A packet read from the broker, owned.
@@ -41,6 +61,27 @@ impl Client {
     /// Connects with any CONNECT packet. Returns the client and the CONNACK's session-present
     /// flag; a refusing CONNACK is an error of kind `ConnectionRefused` naming the code.
     pub fn connect_with(addr: SocketAddr, connect: &Connect<'_>) -> io::Result<(Client, bool)> {
+        Client::open(addr, connect, None)
+    }
+
+    /// Connects over TLS, checking that the broker's certificate is valid for `server_name`.
+    pub fn connect_tls(
+        addr: SocketAddr,
+        client_id: &str,
+        config: Arc<ClientConfig>,
+        server_name: &str,
+    ) -> io::Result<Client> {
+        let name = rustls::pki_types::ServerName::try_from(server_name.to_string()).map_err(io::Error::other)?;
+        let tls = rustls::ClientConnection::new(config, name).map_err(io::Error::other)?;
+        let c = Connect { level: 4, client_id, keep_alive: 60, clean_session: true, ..Connect::default() };
+        Client::open(addr, &c, Some(Box::new(tls))).map(|(client, _)| client)
+    }
+
+    fn open(
+        addr: SocketAddr,
+        connect: &Connect<'_>,
+        tls: Option<Box<rustls::ClientConnection>>,
+    ) -> io::Result<(Client, bool)> {
         let stream = TcpStream::connect(addr)?;
         stream.set_nodelay(true)?;
         let mut c = Client {
@@ -54,6 +95,7 @@ impl Client {
             last_packet_id: None,
             last_dup: false,
             qos2: Vec::new(),
+            tls,
         };
         codec::connect_with(&mut c.out, connect);
         c.flush()?;
@@ -127,9 +169,24 @@ impl Client {
     }
 
     pub fn flush(&mut self) -> io::Result<()> {
-        self.stream.write_all(&self.out)?;
+        let out = std::mem::take(&mut self.out);
+        let written = self.write_raw(&out);
+        self.out = out;
         self.out.clear();
-        Ok(())
+        written
+    }
+
+    fn write_raw(&mut self, data: &[u8]) -> io::Result<()> {
+        match self.tls.as_mut() {
+            None => self.stream.write_all(data),
+            Some(tls) => {
+                tls.writer().write_all(data)?;
+                while tls.wants_write() {
+                    tls.write_tls(&mut self.stream)?;
+                }
+                Ok(())
+            }
+        }
     }
 
     /// Subscribes at QoS 0 and waits for the SUBACK.
@@ -292,6 +349,10 @@ impl Client {
     /// Writes pending PUBACKs; on a non-blocking stream, what does not fit waits for the next
     /// call.
     fn send_acks(&mut self) -> io::Result<()> {
+        if self.tls.is_some() {
+            let acks = std::mem::take(&mut self.acks);
+            return self.write_raw(&acks);
+        }
         let mut done = 0;
         while done < self.acks.len() {
             match self.stream.write(&self.acks[done..]) {
@@ -328,6 +389,42 @@ impl Client {
         }
         let len = self.buf.len();
         self.buf.resize(len + 64 * 1024, 0);
+        if let Some(tls) = self.tls.as_mut() {
+            loop {
+                match tls.reader().read(&mut self.buf[len..]) {
+                    Ok(0) => {
+                        self.buf.truncate(len);
+                        return Err(io::ErrorKind::UnexpectedEof.into());
+                    }
+                    Ok(n) => {
+                        self.buf.truncate(len + n);
+                        return Ok(());
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(e) => {
+                        self.buf.truncate(len);
+                        return Err(e);
+                    }
+                }
+                // No plaintext yet: more ciphertext.
+                match tls.read_tls(&mut self.stream) {
+                    Ok(0) => {
+                        self.buf.truncate(len);
+                        return Err(io::ErrorKind::UnexpectedEof.into());
+                    }
+                    Ok(_) => {
+                        tls.process_new_packets().map_err(io::Error::other)?;
+                        while tls.wants_write() {
+                            tls.write_tls(&mut self.stream)?;
+                        }
+                    }
+                    Err(e) => {
+                        self.buf.truncate(len);
+                        return Err(e);
+                    }
+                }
+            }
+        }
         let n = self.stream.read(&mut self.buf[len..]);
         self.buf.truncate(len + *n.as_ref().unwrap_or(&0));
         match n {
