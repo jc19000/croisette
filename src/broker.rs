@@ -27,10 +27,10 @@ use std::time::Duration;
 use cannes::{Actor, ActorId, ActorRef, Context, CoreId, CoreMode, Engine, Handler, IoCompletion, StartSequence};
 
 use crate::auth::{self, Auth, Rule};
-use crate::codec::{self, Packet};
+use crate::codec::{self, prop, reason, Packet};
 use crate::index::{Entry, Sub, SubIndex};
 use crate::net;
-use crate::persist::{self, Saved, SavedSession};
+use crate::persist::{self, Msg, Saved, SavedRetained, SavedSession};
 use crate::tls::{ServerConfig, Tls};
 use crate::ws::Ws;
 
@@ -75,10 +75,10 @@ struct SubRemove {
     sub: Sub,
 }
 
-/// A message for connections of the receiving core: its QoS 0 encoding, and each connection with
-/// the QoS it gets (min of the message's and the subscription's).
+/// A message for connections of the receiving core, and each connection with its delivery
+/// options (the QoS it gets: min of the message's and the subscription's; Retain As Published).
 struct Deliver {
-    packet: Vec<u8>,
+    msg: Msg,
     conns: Vec<(u64, u8)>,
 }
 
@@ -90,13 +90,68 @@ struct DeliverAck {
 
 /// Size counted for a `Deliver` in the credit between cores.
 fn deliver_size(d: &Deliver) -> usize {
-    d.packet.len() + d.conns.len() * 9
+    d.msg.packet.len() + d.msg.props.len() + d.conns.len() * 9
 }
+
+/// UNIX time in seconds, for message and session expiry.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+/// Delivery options, as in a SUBSCRIBE options byte: QoS in bits 0-1, then these.
+const NO_LOCAL: u8 = 0x04;
+const RETAIN_AS_PUBLISHED: u8 = 0x08;
+
+/// Merges the options of two subscriptions of a connection matching one message: the highest
+/// QoS, Retain As Published if either has it.
+fn merge_options(a: u8, b: u8) -> u8 {
+    (a & 3).max(b & 3) | ((a | b) & RETAIN_AS_PUBLISHED)
+}
+
+/// Appends `m` for a connection: at `qos` with packet id `id`, as MQTT 5 if `v5`, with the
+/// retain flag if `retain`. False (nothing appended) if it expired.
+fn encode_msg(out: &mut Vec<u8>, m: &Msg, qos: u8, id: u16, v5: bool, retain: bool) -> bool {
+    let remaining = match m.expires {
+        Some(t) => {
+            let now = unix_now();
+            if now >= t {
+                return false;
+            }
+            Some((t - now).min(u32::MAX as u64) as u32)
+        }
+        None => None,
+    };
+    let start = out.len();
+    if v5 {
+        codec::requalify_v5(out, &m.packet, qos, id, &m.props, remaining);
+    } else if qos == 0 {
+        out.extend_from_slice(&m.packet);
+    } else {
+        codec::requalify(out, &m.packet, qos, id);
+    }
+    if retain {
+        out[start] |= 1;
+    }
+    true
+}
+
+/// MQTT 5 topic aliases a client may set (Topic Alias Maximum in CONNACK).
+const TOPIC_ALIAS_MAX: u16 = 64;
 
 struct Retain {
     topic: Box<str>,
     payload: Vec<u8>,
     qos: u8,
+    props: Vec<u8>,
+    expires: Option<u64>,
+}
+
+/// A retained message in the context tier.
+struct Retained {
+    payload: Vec<u8>,
+    qos: u8,
+    props: Vec<u8>,
+    expires: Option<u64>,
 }
 
 struct RetainedQuery {
@@ -110,6 +165,9 @@ struct Open {
     client_id: Box<str>,
     sub: Sub,
     clean: bool,
+    /// Session expiry interval in seconds (0: the session ends with the connection; u32::MAX:
+    /// never). MQTT 3.1.1: clean session 1 is 0, 0 is u32::MAX.
+    expiry: u32,
 }
 
 /// context -> connection: the session is the connection's. `present`: a persistent session
@@ -130,7 +188,7 @@ struct Opened {
 #[derive(Default)]
 struct Undelivered {
     inflight: Vec<(u16, Vec<u8>)>,
-    queue: VecDeque<(u8, Vec<u8>)>,
+    queue: VecDeque<(u8, Msg)>,
     received: Vec<u16>,
 }
 
@@ -154,6 +212,8 @@ struct Park {
     sub: Sub,
     filters: Option<Vec<(Box<str>, u8)>>,
     state: Undelivered,
+    /// The session expiry interval at the end of the connection (DISCONNECT may change it).
+    expiry: u32,
 }
 
 /// Counters of a core's connection tier, sent every `sys_interval` to the first core, which
@@ -205,7 +265,7 @@ impl Handler<SubRemove> for Router {
 
 pub struct Contexts {
     topology: Arc<Topology>,
-    retained: HashMap<Box<str>, (Vec<u8>, u8)>,
+    retained: HashMap<Box<str>, Retained>,
     by_client: HashMap<Box<str>, u32>,
     sessions: HashMap<u32, Session>,
     next_sid: u32,
@@ -220,6 +280,9 @@ pub struct Contexts {
 struct Session {
     client_id: Box<str>,
     persistent: bool,
+    /// Session expiry interval (seconds, u32::MAX: never) and when it went offline.
+    expiry: u32,
+    offline_since: u64,
     state: SessionState,
     /// Subscriptions, kept while the session is offline (persistent sessions).
     filters: Vec<(Box<str>, u8)>,
@@ -236,6 +299,7 @@ enum SessionState {
         old: Sub,
         new: Sub,
         clean: bool,
+        expiry: u32,
     },
 }
 
@@ -284,13 +348,25 @@ impl Contexts {
     /// Retained messages and persistent sessions, for a snapshot. Online sessions are saved
     /// with their subscriptions only.
     pub fn snapshot(&self) -> Saved {
-        let retained = self.retained.iter().map(|(t, (p, q))| (t.to_string(), p.clone(), *q)).collect();
+        let retained = self
+            .retained
+            .iter()
+            .map(|(t, r)| SavedRetained {
+                topic: t.to_string(),
+                payload: r.payload.clone(),
+                qos: r.qos,
+                props: r.props.clone(),
+                expires: r.expires,
+            })
+            .collect();
         let sessions = self
             .sessions
             .values()
             .filter(|s| s.persistent)
             .map(|s| SavedSession {
                 client_id: s.client_id.to_string(),
+                expiry: s.expiry,
+                offline_since: if matches!(s.state, SessionState::Offline) { s.offline_since } else { unix_now() },
                 filters: s.filters.iter().map(|(f, q)| (f.to_string(), *q)).collect(),
                 inflight: s.undelivered.inflight.clone(),
                 queue: s.undelivered.queue.iter().cloned().collect(),
@@ -302,20 +378,23 @@ impl Contexts {
 
     /// Restores a snapshot: retained messages, and persistent sessions, offline.
     fn restore(&mut self, saved: Saved) {
-        for (topic, payload, qos) in saved.retained {
-            self.retained.insert(topic.into(), (payload, qos));
+        for r in saved.retained {
+            let retained = Retained { payload: r.payload, qos: r.qos, props: r.props, expires: r.expires };
+            self.retained.insert(r.topic.into(), retained);
         }
         for x in saved.sessions {
             let sid = self.next_sid;
             self.next_sid += 1;
-            let queue: VecDeque<(u8, Vec<u8>)> = x.queue.into();
-            let queued_bytes = queue.iter().map(|q| q.1.len()).sum();
+            let queue: VecDeque<(u8, Msg)> = x.queue.into();
+            let queued_bytes = queue.iter().map(|q| q.1.packet.len()).sum();
             self.by_client.insert(x.client_id.as_str().into(), sid);
             self.sessions.insert(
                 sid,
                 Session {
                     client_id: x.client_id.into(),
                     persistent: true,
+                    expiry: x.expiry,
+                    offline_since: x.offline_since,
                     state: SessionState::Offline,
                     filters: x.filters.into_iter().map(|(f, q)| (f.into(), q)).collect(),
                     undelivered: Undelivered { inflight: x.inflight, queue, received: x.received },
@@ -340,26 +419,28 @@ impl Handler<SessionFilters> for Contexts {
 impl Contexts {
     /// Gives session `sid` to connection `sub` (fresh session if `clean` or none): replies
     /// `Opened`, with the state of a persistent session left offline.
-    fn open(&mut self, ctx: &mut Context, client_id: &str, sub: Sub, clean: bool) {
+    fn open(&mut self, ctx: &mut Context, client_id: &str, sub: Sub, clean: bool, expiry: u32) {
         let existing = self.by_client.get(client_id).copied();
         if let Some(sid) = existing {
             let s = self.sessions.get_mut(&sid).unwrap();
             match s.state {
                 SessionState::Online(old) if old != sub => {
                     // Takeover: the old connection hands the session back when it closes.
-                    s.state = SessionState::TakingOver { old, new: sub, clean };
+                    s.state = SessionState::TakingOver { old, new: sub, clean, expiry };
                     ctx.send(actor(old.0 as CoreId, CONNECTIONS), Kick { conn: old.1 });
                     return;
                 }
                 SessionState::TakingOver { old, new, .. } => {
                     // A third connection: it replaces the one waiting.
-                    s.state = SessionState::TakingOver { old, new: sub, clean };
+                    s.state = SessionState::TakingOver { old, new: sub, clean, expiry };
                     ctx.send(actor(new.0 as CoreId, CONNECTIONS), Kick { conn: new.1 });
                     return;
                 }
                 SessionState::Offline if !clean => {
                     s.state = SessionState::Online(sub);
                     s.queued_bytes = 0;
+                    s.expiry = expiry;
+                    s.persistent = expiry > 0;
                     let state = std::mem::take(&mut s.undelivered);
                     let filters = s.filters.clone();
                     ctx.send(
@@ -378,7 +459,9 @@ impl Contexts {
             sid,
             Session {
                 client_id: client_id.into(),
-                persistent: !clean,
+                persistent: expiry > 0,
+                expiry,
+                offline_since: 0,
                 state: SessionState::Online(sub),
                 filters: Vec::new(),
                 undelivered: Undelivered::default(),
@@ -412,13 +495,17 @@ impl Contexts {
         let s = self.sessions.get_mut(&sid).unwrap();
         let (owner, next) = match s.state {
             SessionState::Online(o) => (o, None),
-            SessionState::TakingOver { old, new, clean } => (old, Some((new, clean))),
+            SessionState::TakingOver { old, new, clean, expiry } => (old, Some((new, clean, expiry))),
             // A connection closed before it got its session: the session comes back from it.
             SessionState::Offline if park.is_some() => (sub, None),
             SessionState::Offline => return,
         };
         if owner != sub {
             return; // stale
+        }
+        if let Some(p) = park {
+            s.expiry = p.expiry;
+            s.persistent = p.expiry > 0;
         }
         match park {
             Some(p) if s.persistent => {
@@ -430,7 +517,7 @@ impl Contexts {
                 inflight.append(&mut s.undelivered.inflight);
                 let mut queue = p.state.queue.clone();
                 queue.append(&mut s.undelivered.queue);
-                s.queued_bytes = queue.iter().map(|q| q.1.len()).sum();
+                s.queued_bytes = queue.iter().map(|q| q.1.packet.len()).sum();
                 let received = if p.state.received.is_empty() {
                     std::mem::take(&mut s.undelivered.received)
                 } else {
@@ -438,34 +525,53 @@ impl Contexts {
                 };
                 s.undelivered = Undelivered { inflight, queue, received };
                 s.state = SessionState::Offline;
+                s.offline_since = unix_now();
             }
             _ => {
                 self.sessions.remove(&sid);
                 self.by_client.remove(client_id);
             }
         }
-        if let Some((new, clean)) = next {
-            self.open(ctx, client_id, new, clean);
+        if let Some((new, clean, expiry)) = next {
+            self.open(ctx, client_id, new, clean, expiry);
         }
     }
 
     /// A message for session target `sid` (synchronous call from the connection tier of this
     /// core): forwarded to the session's connection, or queued (QoS 1) while it is offline.
-    fn session_message(&mut self, ctx: &mut Context, sid: u32, packet: &[u8], qos: u8) {
+    fn session_message(&mut self, ctx: &mut Context, sid: u32, m: &Msg, options: u8) {
         let Some(s) = self.sessions.get_mut(&sid) else { return };
         match s.state {
             SessionState::Online(sub) => {
                 ctx.send(
                     actor(sub.0 as CoreId, CONNECTIONS),
-                    Deliver { packet: packet.to_vec(), conns: vec![(sub.1, qos)] },
+                    Deliver { msg: m.clone(), conns: vec![(sub.1, options)] },
                 );
             }
-            _ if qos > 0 && s.queued_bytes < self.max_queued => {
-                s.queued_bytes += packet.len();
-                s.undelivered.queue.push_back((qos, packet.to_vec()));
+            _ if options & 3 > 0 && s.queued_bytes < self.max_queued => {
+                s.queued_bytes += m.packet.len();
+                s.undelivered.queue.push_back((options, m.clone()));
             }
             _ => {} // QoS 0 messages are not kept for offline sessions
         }
+    }
+
+    /// Ends the offline sessions whose expiry interval passed.
+    pub fn expire(&mut self, ctx: &mut Context, now: u64) {
+        let expired: Vec<u32> = self
+            .sessions
+            .iter()
+            .filter(|(_, s)| {
+                matches!(s.state, SessionState::Offline)
+                    && s.expiry != u32::MAX
+                    && now >= s.offline_since + s.expiry as u64
+            })
+            .map(|(&sid, _)| sid)
+            .collect();
+        for sid in expired {
+            self.discard(ctx, sid);
+        }
+        self.retained.retain(|_, r| r.expires.is_none_or(|t| now < t));
     }
 }
 
@@ -474,18 +580,21 @@ impl Handler<Retain> for Contexts {
         if e.payload.is_empty() {
             self.retained.remove(&e.topic);
         } else {
-            self.retained.insert(e.topic.clone(), (e.payload.clone(), e.qos));
+            let r = Retained { payload: e.payload.clone(), qos: e.qos, props: e.props.clone(), expires: e.expires };
+            self.retained.insert(e.topic.clone(), r);
         }
     }
 }
 
 impl Handler<RetainedQuery> for Contexts {
     fn on_event(&mut self, ctx: &mut Context, src: ActorId, q: &RetainedQuery) {
-        for (topic, (payload, qos)) in &self.retained {
-            if codec::matches(&q.filter, topic) {
+        let now = unix_now();
+        for (topic, r) in &self.retained {
+            if codec::matches(&q.filter, topic) && r.expires.is_none_or(|t| now < t) {
                 let mut packet = Vec::new();
-                codec::publish(&mut packet, topic, payload, 0, true, None);
-                ctx.send(src, Deliver { packet, conns: vec![(q.conn, (*qos).min(q.qos))] });
+                codec::publish(&mut packet, topic, &r.payload, 0, true, None);
+                let msg = Msg { packet, props: r.props.clone(), expires: r.expires, retained: true };
+                ctx.send(src, Deliver { msg, conns: vec![(q.conn, r.qos.min(q.qos))] });
             }
         }
     }
@@ -493,7 +602,7 @@ impl Handler<RetainedQuery> for Contexts {
 
 impl Handler<Open> for Contexts {
     fn on_event(&mut self, ctx: &mut Context, _src: ActorId, o: &Open) {
-        self.open(ctx, &o.client_id, o.sub, o.clean);
+        self.open(ctx, &o.client_id, o.sub, o.clean, o.expiry);
     }
 }
 
@@ -533,6 +642,8 @@ struct OwnedWill {
     payload: Vec<u8>,
     qos: u8,
     retain: bool,
+    props: Vec<u8>,
+    expiry: Option<u32>,
 }
 
 /// QoS 1 and 2 state of a connection, allocated with its first QoS 1 or 2 message: messages sent
@@ -543,8 +654,8 @@ struct Outbound {
     last_id: u16,
     /// Packet id and encoding, kept for redelivery; empty once a QoS 2 message is at PUBREL.
     inflight: VecDeque<(u16, Vec<u8>)>,
-    /// QoS and QoS 0 encoding, given an id when they enter the window.
-    pending: VecDeque<(u8, Vec<u8>)>,
+    /// Delivery options and message, given an id when they enter the window.
+    pending: VecDeque<(u8, Msg)>,
     pending_bytes: usize,
     /// Ids of QoS 2 messages received from the client, until its PUBREL.
     received: Vec<u16>,
@@ -560,12 +671,22 @@ impl Outbound {
         }
     }
 
-    /// Moves `packet` into the window: encoded at `qos` with a fresh id at the end of `out`.
-    fn send(&mut self, out: &mut Vec<u8>, packet: &[u8], qos: u8) {
+    /// Moves `m` into the window: encoded with a fresh id at the end of `out`, with the QoS and
+    /// retain flag of `options`, for MQTT 5 if `v5`. False if it expired or is larger than
+    /// `max_out` (0: no limit).
+    fn send(&mut self, out: &mut Vec<u8>, m: &Msg, options: u8, v5: bool, max_out: usize) -> bool {
         let id = self.next_id();
         let start = out.len();
-        codec::requalify(out, packet, qos, id);
+        let retain = options & RETAIN_AS_PUBLISHED != 0 && m.retained;
+        if !encode_msg(out, m, options & 3, id, v5, retain) {
+            return false;
+        }
+        if max_out > 0 && out.len() - start > max_out {
+            out.truncate(start);
+            return false;
+        }
         self.inflight.push_back((id, out[start..].to_vec()));
+        true
     }
 }
 
@@ -592,8 +713,17 @@ struct Conn {
     will: Option<Box<OwnedWill>>,
     close_after_flush: bool,
     outbound: Option<Box<Outbound>>,
-    /// CONNECT asked for a persistent session.
+    /// CONNECT asked for a persistent session (session expiry interval above 0).
     persistent: bool,
+    /// Session expiry interval in seconds (u32::MAX: never).
+    session_expiry: u32,
+    /// MQTT 5 connection, its maximum packet size (0: none), its receive maximum (our in-flight
+    /// window), its topic aliases, and whether the broker chose its client id.
+    v5: bool,
+    max_out: u32,
+    window: usize,
+    aliases: Option<Box<[Option<Box<str>>]>>,
+    assigned_id: bool,
     /// Session id, once `Opened`.
     session: Option<u32>,
     /// Bytes received after CONNECT, held until the session is opened.
@@ -725,6 +855,12 @@ impl Connections {
             close_after_flush: false,
             outbound: None,
             persistent: false,
+            session_expiry: 0,
+            v5: false,
+            max_out: 0,
+            window: self.max_inflight,
+            aliases: None,
+            assigned_id: false,
             session: None,
             held: None,
             rules: None,
@@ -784,14 +920,19 @@ impl Connections {
             self.remove_sub(ctx, filter, sub);
         }
         if let Some(will) = conn.will {
+            let expires = will.expiry.map(|e| unix_now() + e as u64);
             if will.retain {
                 let partition = self.topology.partition(&will.topic);
-                ctx.send(
-                    actor(partition, CONTEXT),
-                    Retain { topic: will.topic.clone(), payload: will.payload.clone(), qos: will.qos },
-                );
+                let retain = Retain {
+                    topic: will.topic.clone(),
+                    payload: will.payload.clone(),
+                    qos: will.qos,
+                    props: will.props.clone(),
+                    expires,
+                };
+                ctx.send(actor(partition, CONTEXT), retain);
             }
-            self.publish(ctx, &will.topic, &will.payload, will.qos);
+            self.publish(ctx, &will.topic, &will.payload, will.qos, &will.props, expires, will.retain, None);
         }
         if let Some(client_id) = conn.client_id {
             let partition = self.topology.partition(&client_id);
@@ -803,7 +944,8 @@ impl Connections {
                     state.received = ob.received;
                 }
                 let filters = conn.session.map(|_| conn.filters);
-                ctx.send(actor(partition, CONTEXT), Park { client_id, sub, filters, state });
+                let expiry = conn.session_expiry;
+                ctx.send(actor(partition, CONTEXT), Park { client_id, sub, filters, state, expiry });
             } else {
                 ctx.send(actor(partition, CONTEXT), Unregister { client_id, sub });
             }
@@ -818,6 +960,9 @@ impl Connections {
             return;
         }
         self.bytes_in += result as u64;
+        if self.get(id).is_some_and(|c| c.close_after_flush) {
+            return; // closing (refused CONNECT, DISCONNECT sent): no more reads
+        }
         let filled = buf.len() == buf.capacity();
         let Some(conn) = self.get(id) else { return };
         if conn.tls.is_some() || conn.ws.is_some() {
@@ -878,7 +1023,8 @@ impl Connections {
     fn parse_all(&mut self, ctx: &mut Context, id: u64, data: &mut Vec<u8>) -> bool {
         let mut consumed = 0;
         loop {
-            match codec::parse_limited(&data[consumed..], self.max_packet) {
+            let v5 = self.get(id).is_some_and(|c| c.v5);
+            match codec::parse_limited(&data[consumed..], self.max_packet, v5) {
                 Ok(Some((packet, len))) => {
                     consumed += len;
                     match self.handle(ctx, id, packet) {
@@ -901,8 +1047,9 @@ impl Connections {
                     }
                 }
                 Ok(None) => break,
-                Err(_) => {
-                    self.close(ctx, id);
+                Err(e) => {
+                    let code = if e == codec::Error::TooLarge { reason::PACKET_TOO_LARGE } else { reason::MALFORMED };
+                    self.disconnect(ctx, id, code);
                     return false;
                 }
             }
@@ -970,6 +1117,19 @@ impl Connections {
         ctx.send(actor(partition, CONTEXT), msg);
     }
 
+    /// Closes connection `id` for a protocol reason: MQTT 5 clients first get a DISCONNECT with
+    /// the reason code.
+    fn disconnect(&mut self, ctx: &mut Context, id: u64, code: u8) {
+        let Some(conn) = self.get(id) else { return };
+        if conn.v5 && conn.connected {
+            codec::disconnect_v5(&mut conn.out, code);
+            conn.close_after_flush = true;
+            self.mark_dirty(ctx, id);
+        } else {
+            self.close(ctx, id);
+        }
+    }
+
     /// Once per `TICK`: closes connections silent for 1.5 keep-alive periods, and connections
     /// that did not send CONNECT in time.
     fn sweep(&mut self, ctx: &mut Context) {
@@ -989,8 +1149,9 @@ impl Connections {
             .map(|i| self.id(i))
             .collect();
         for id in expired {
-            self.close(ctx, id);
+            self.disconnect(ctx, id, reason::KEEP_ALIVE_TIMEOUT);
         }
+        self.contexts.as_ref().unwrap().borrow_mut().expire(ctx, unix_now());
         self.forwards.retain(|_, f| tick.wrapping_sub(f.2) <= 2);
         if self.autosave > 0 && tick % self.autosave == 0 && self.saving.is_none() {
             self.save(ctx);
@@ -1019,27 +1180,47 @@ impl Connections {
     fn handle(&mut self, ctx: &mut Context, id: u64, packet: Packet<'_>) -> Next {
         let core = self.core(ctx);
         let auth = if matches!(packet, Packet::Connect(_)) { self.auth.clone() } else { None };
+        let max_inflight = self.max_inflight;
         let conn = self.get(id).unwrap();
         if conn.connected == matches!(packet, Packet::Connect(_)) {
             return Next::Close; // anything before CONNECT, or a second CONNECT
         }
+        let v5 = conn.v5;
         match packet {
             Packet::Connect(c) => {
-                let code = if c.level != 4 && c.level != 3 {
+                let v5 = c.level == 5;
+                conn.v5 = v5;
+                let code = if !matches!(c.level, 3..=5) {
                     1 // unacceptable protocol version
-                } else if c.client_id.is_empty() && !c.clean_session {
-                    2 // identifier rejected
+                } else if c.client_id.is_empty() && !c.clean_session && !v5 {
+                    2 // identifier rejected (MQTT 5: the broker assigns one)
+                } else if v5 && c.auth_method.is_some() {
+                    reason::BAD_AUTH_METHOD // no enhanced authentication
                 } else if let Some(a) = &auth {
-                    a.check(c.username, c.password)
+                    match a.check(c.username, c.password) {
+                        auth::BAD_CREDENTIALS if v5 => reason::BAD_CREDENTIALS,
+                        auth::NOT_AUTHORIZED if v5 => reason::NOT_AUTHORIZED,
+                        code => code,
+                    }
                 } else {
                     0
                 };
                 if code != 0 {
-                    codec::connack(&mut conn.out, false, code);
+                    if v5 {
+                        codec::connack_v5(&mut conn.out, false, code, &[]);
+                    } else {
+                        codec::connack(&mut conn.out, false, code);
+                    }
                     return Next::CloseAfterFlush;
                 }
                 conn.connected = true;
                 conn.keep_alive = c.keep_alive;
+                if v5 {
+                    if let Some(m) = c.receive_maximum.filter(|&m| m > 0) {
+                        conn.window = (m as usize).min(max_inflight);
+                    }
+                    conn.max_out = c.maximum_packet_size.unwrap_or(0);
+                }
                 conn.rules = auth.and_then(|a| a.rules(c.username, c.client_id)).map(Vec::into_boxed_slice);
                 let will_allowed = |topic: &str| conn.rules.as_ref().is_none_or(|r| auth::can_write(r, topic));
                 let will = c.will.filter(|w| will_allowed(w.topic));
@@ -1049,106 +1230,182 @@ impl Connections {
                         payload: w.payload.to_vec(),
                         qos: w.qos,
                         retain: w.retain,
+                        props: w.props,
+                        expiry: w.expiry,
                     })
                 });
-                conn.persistent = !c.clean_session;
-                if c.client_id.is_empty() {
+                let expiry = match (v5, c.clean_session) {
+                    (true, _) => c.session_expiry.unwrap_or(0),
+                    (false, true) => 0,
+                    (false, false) => u32::MAX,
+                };
+                conn.session_expiry = expiry;
+                conn.persistent = expiry > 0;
+                let client_id: Box<str> = if c.client_id.is_empty() && v5 {
+                    conn.assigned_id = true;
+                    format!("croisette-{core}-{id:x}").into()
+                } else {
+                    c.client_id.into()
+                };
+                if client_id.is_empty() {
                     codec::connack(&mut conn.out, false, 0);
                     self.mark_dirty(ctx, id);
                 } else {
                     // CONNACK once the context partition of the client id has the session.
-                    conn.client_id = Some(c.client_id.into());
-                    let partition = self.topology.partition(c.client_id);
-                    let open = Open { client_id: c.client_id.into(), sub: (core, id), clean: c.clean_session };
+                    conn.client_id = Some(client_id.clone());
+                    let partition = self.topology.partition(&client_id);
+                    let open = Open { client_id, sub: (core, id), clean: c.clean_session, expiry };
                     ctx.send(actor(partition, CONTEXT), open);
                     return Next::WaitSession;
                 }
             }
-            Packet::Publish { topic, payload, qos, retain, packet_id, .. } => {
-                // A publish the ACL denies is acknowledged as usual and not routed.
+            Packet::Publish { topic, payload, qos, retain, packet_id, props, topic_alias, expiry, .. } => {
+                // MQTT 5 topic alias: set by a PUBLISH with a topic, used by one without.
+                let mut aliased = None;
+                match topic_alias {
+                    Some(a) if a == 0 || a > TOPIC_ALIAS_MAX => {
+                        self.disconnect(ctx, id, reason::TOPIC_ALIAS_INVALID);
+                        return Next::Continue;
+                    }
+                    Some(a) => {
+                        let aliases = conn
+                            .aliases
+                            .get_or_insert_with(|| vec![None; TOPIC_ALIAS_MAX as usize + 1].into_boxed_slice());
+                        if topic.is_empty() {
+                            match &aliases[a as usize] {
+                                Some(t) => aliased = Some(t.clone()),
+                                None => {
+                                    self.disconnect(ctx, id, reason::PROTOCOL_ERROR);
+                                    return Next::Continue;
+                                }
+                            }
+                        } else {
+                            aliases[a as usize] = Some(topic.into());
+                        }
+                    }
+                    None if topic.is_empty() => {
+                        self.disconnect(ctx, id, reason::PROTOCOL_ERROR);
+                        return Next::Continue;
+                    }
+                    None => {}
+                }
+                let topic: &str = aliased.as_deref().unwrap_or(topic);
+                // A publish the ACL denies is acknowledged (MQTT 5: with Not authorized) and not
+                // routed.
                 let allowed = conn.rules.as_ref().is_none_or(|r| auth::can_write(r, topic));
+                let pid = packet_id.unwrap_or(0);
                 if qos == 2 {
                     // Routed once: a copy with the same id before PUBREL is a redelivery.
-                    let pid = packet_id.unwrap_or(0);
-                    let conn = self.get(id).unwrap();
                     let ob = conn.outbound.get_or_insert_with(Default::default);
                     let again = ob.received.contains(&pid);
                     if !again {
                         ob.received.push(pid);
                     }
-                    codec::pubrec(&mut conn.out, pid);
-                    self.mark_dirty(ctx, id);
+                    let code = if allowed || !v5 { reason::SUCCESS } else { reason::NOT_AUTHORIZED };
+                    codec::ack_v5(&mut conn.out, 0x50, pid, code);
                     if again || !allowed {
+                        self.mark_dirty(ctx, id);
                         return Next::Continue;
                     }
                 }
                 if !allowed {
                     if qos == 1 {
-                        codec::puback(&mut self.get(id).unwrap().out, packet_id.unwrap_or(0));
+                        let code = if v5 { reason::NOT_AUTHORIZED } else { reason::SUCCESS };
+                        codec::ack_v5(&mut conn.out, 0x40, pid, code);
                         self.mark_dirty(ctx, id);
                     }
                     return Next::Continue;
                 }
                 self.received_msgs += 1;
+                let expires = expiry.map(|e| unix_now() + e as u64);
                 if retain {
                     let partition = self.topology.partition(topic);
-                    ctx.send(actor(partition, CONTEXT), Retain { topic: topic.into(), payload: payload.to_vec(), qos });
+                    let r =
+                        Retain { topic: topic.into(), payload: payload.to_vec(), qos, props: props.to_vec(), expires };
+                    ctx.send(actor(partition, CONTEXT), r);
                 }
-                self.publish(ctx, topic, payload, qos);
+                let n = self.publish(ctx, topic, payload, qos, &props, expires, retain, Some(id));
+                if qos == 2 {
+                    self.mark_dirty(ctx, id); // the PUBREC
+                }
                 if qos == 1 {
-                    codec::puback(&mut self.get(id).unwrap().out, packet_id.unwrap_or(0));
+                    let code = if v5 && n == 0 { reason::NO_MATCHING_SUBSCRIBERS } else { reason::SUCCESS };
+                    codec::ack_v5(&mut self.get(id).unwrap().out, 0x40, pid, code);
                     self.mark_dirty(ctx, id);
                 }
             }
             Packet::Subscribe { packet_id, filters } => {
                 let sub = (core, id);
                 let rules = conn.rules.as_deref();
+                let deny = if v5 { reason::NOT_AUTHORIZED } else { 0x80 };
+                // Per filter, the granted QoS, or a refusal code.
                 let granted: Vec<u8> = filters
                     .iter()
-                    .map(|&(f, q)| if rules.is_none_or(|r| auth::can_read(r, f)) { q.min(2) } else { 0x80 })
+                    .map(|&(f, o)| if rules.is_none_or(|r| auth::can_read(r, f)) { (o & 3).min(2) } else { deny })
                     .collect();
-                for (&(filter, _), &qos) in filters.iter().zip(&granted) {
-                    if qos == 0x80 {
+                let existed: Vec<bool> =
+                    filters.iter().map(|(f, _)| conn.filters.iter().any(|g| &*g.0 == *f)).collect();
+                for (i, &(filter, options)) in filters.iter().enumerate() {
+                    if granted[i] >= 0x80 {
                         continue; // refused
                     }
-                    self.add_sub(ctx, filter, sub, qos);
-                    if crate::index::shared(filter).is_none() {
-                        // Retained messages are not sent for shared subscriptions.
+                    let entry = granted[i] | (options & (NO_LOCAL | RETAIN_AS_PUBLISHED));
+                    self.add_sub(ctx, filter, sub, entry);
+                    // Retained messages: Retain Handling 0 always, 1 for a new subscription, 2
+                    // never; none for shared subscriptions.
+                    let handling = (options >> 4) & 3;
+                    let send = handling == 0 || (handling == 1 && !existed[i]);
+                    if send && crate::index::shared(filter).is_none() {
                         for &other in &self.topology.cores {
-                            ctx.send(actor(other, CONTEXT), RetainedQuery { filter: filter.into(), conn: id, qos });
+                            let q = RetainedQuery { filter: filter.into(), conn: id, qos: granted[i] };
+                            ctx.send(actor(other, CONTEXT), q);
                         }
                     }
                 }
                 let conn = self.get(id).unwrap();
-                for (&(f, _), &qos) in filters.iter().zip(&granted).filter(|(_, &q)| q != 0x80) {
-                    match conn.filters.iter_mut().find(|g| &*g.0 == f) {
-                        Some(g) => g.1 = qos,
-                        None => conn.filters.push((f.into(), qos)),
+                for (i, &(f, options)) in filters.iter().enumerate() {
+                    if granted[i] < 0x80 {
+                        let entry = granted[i] | (options & (NO_LOCAL | RETAIN_AS_PUBLISHED));
+                        match conn.filters.iter_mut().find(|g| &*g.0 == f) {
+                            Some(g) => g.1 = entry,
+                            None => conn.filters.push((f.into(), entry)),
+                        }
                     }
                 }
-                codec::suback(&mut conn.out, packet_id, &granted);
+                if v5 {
+                    codec::suback_v5(&mut conn.out, packet_id, &granted);
+                } else {
+                    codec::suback(&mut conn.out, packet_id, &granted);
+                }
                 self.mark_dirty(ctx, id);
                 self.sync_session_filters(ctx, id);
             }
             Packet::Unsubscribe { packet_id, filters } => {
                 let sub = (core, id);
+                let codes: Vec<u8> = filters
+                    .iter()
+                    .map(|f| if conn.filters.iter().any(|g| &*g.0 == *f) { 0 } else { reason::NO_SUBSCRIPTION_EXISTED })
+                    .collect();
                 for filter in &filters {
                     self.remove_sub(ctx, filter, sub);
                 }
                 let conn = self.get(id).unwrap();
                 conn.filters.retain(|(f, _)| !filters.contains(&&**f));
-                codec::unsuback(&mut conn.out, packet_id);
+                if v5 {
+                    codec::unsuback_v5(&mut conn.out, packet_id, &codes);
+                } else {
+                    codec::unsuback(&mut conn.out, packet_id);
+                }
                 self.mark_dirty(ctx, id);
                 self.sync_session_filters(ctx, id);
             }
             Packet::PingReq => {
-                codec::pingresp(&mut self.get(id).unwrap().out);
+                codec::pingresp(&mut conn.out);
                 self.mark_dirty(ctx, id);
             }
             Packet::PubAck { packet_id } | Packet::PubComp { packet_id } => self.acked(ctx, id, packet_id),
             Packet::PubRec { packet_id } => {
                 // QoS 2 to the client, step 2: keep the id until PUBCOMP, the message is theirs.
-                let conn = self.get(id).unwrap();
                 if let Some(ob) = conn.outbound.as_mut() {
                     if let Some(e) = ob.inflight.iter_mut().find(|e| e.0 == packet_id) {
                         e.1 = Vec::new();
@@ -1159,31 +1416,57 @@ impl Connections {
             }
             Packet::PubRel { packet_id } => {
                 // QoS 2 from the client, step 3: the message may come again with a new id.
-                let conn = self.get(id).unwrap();
                 if let Some(ob) = conn.outbound.as_mut() {
                     ob.received.retain(|&r| r != packet_id);
                 }
                 codec::pubcomp(&mut conn.out, packet_id);
                 self.mark_dirty(ctx, id);
             }
-            Packet::Disconnect => {
-                self.get(id).unwrap().will = None; // a clean disconnect discards the will
+            Packet::Disconnect { reason: code, session_expiry } => {
+                // MQTT 5: the session expiry may change; reason 0x04 keeps the will.
+                if let (true, Some(e)) = (v5, session_expiry) {
+                    conn.session_expiry = e;
+                    conn.persistent = e > 0;
+                }
+                if !(v5 && code == 0x04) {
+                    conn.will = None; // a clean disconnect discards the will
+                }
                 return Next::Close;
             }
-            _ => return Next::Close,
+            _ => {
+                self.disconnect(ctx, id, reason::PROTOCOL_ERROR);
+                return Next::Continue;
+            }
         }
         Next::Continue
     }
 
     /// Routes a message: synchronous match on this core's router replica, local delivery, one
-    /// `Deliver` event per other core with subscribers.
-    fn publish(&mut self, ctx: &mut Context, topic: &str, payload: &[u8], qos: u8) {
+    /// `Deliver` event per other core with subscribers. `from`: the publishing connection (No
+    /// Local subscriptions skip it). Returns the number of connections it goes to.
+    #[allow(clippy::too_many_arguments)]
+    fn publish(
+        &mut self,
+        ctx: &mut Context,
+        topic: &str,
+        payload: &[u8],
+        qos: u8,
+        props: &[u8],
+        expires: Option<u64>,
+        retained: bool,
+        from: Option<u64>,
+    ) -> usize {
+        let here = self.core(ctx);
         let mut targets = std::mem::take(&mut self.targets);
         targets.clear();
-        self.router.as_ref().unwrap().borrow().index.for_each_match(topic, |s, q| targets.push((s, q.min(qos))));
+        self.router.as_ref().unwrap().borrow().index.for_each_match(topic, |s, o| {
+            if o & NO_LOCAL == 0 || s.0 != here || Some(s.1) != from {
+                targets.push((s, (o & RETAIN_AS_PUBLISHED) | (o & 3).min(qos)));
+            }
+        });
         if targets.is_empty() {
             self.targets = targets;
-            return;
+            return 0;
         }
         // One delivery per connection, whatever the number of matching filters, at the highest
         // of their QoS.
@@ -1191,25 +1474,25 @@ impl Connections {
         targets.dedup_by(|a, b| {
             let same = a.0 == b.0;
             if same {
-                b.1 = b.1.max(a.1);
+                b.1 = merge_options(a.1, b.1);
             }
             same
         });
         let mut packet = std::mem::take(&mut self.packet);
         packet.clear();
         codec::publish(&mut packet, topic, payload, 0, false, None);
-        let here = self.core(ctx);
+        let msg = Msg { packet, props: props.to_vec(), expires, retained };
         let mut i = 0;
         while i < targets.len() {
             let core = targets[i].0 .0;
             let j = targets[i..].iter().position(|e| e.0 .0 != core).map_or(targets.len(), |n| i + n);
             if core == here {
-                for &((_, id), q) in &targets[i..j] {
-                    self.deliver(ctx, id, &packet, q);
+                for &((_, id), o) in &targets[i..j] {
+                    self.deliver(ctx, id, &msg, o);
                 }
             } else {
-                let conns: Vec<(u64, u8)> = targets[i..j].iter().map(|&((_, id), q)| (id, q)).collect();
-                let d = Deliver { packet: packet.clone(), conns };
+                let conns: Vec<(u64, u8)> = targets[i..j].iter().map(|&((_, id), o)| (id, o)).collect();
+                let d = Deliver { msg: msg.clone(), conns };
                 let size = deliver_size(&d);
                 let c = core as usize;
                 if self.unacked_to.len() <= c {
@@ -1224,53 +1507,63 @@ impl Connections {
             }
             i = j;
         }
-        self.packet = packet;
+        let n = targets.len();
+        self.packet = msg.packet;
         self.targets = targets;
+        n
     }
 
-    /// Queues the message encoded (QoS 0) in `packet` for connection `id` at QoS `qos`.
+    /// Queues message `m` for connection `id` with delivery options `options` (QoS, Retain As
+    /// Published).
     ///
     /// QoS 0 messages are dropped if the connection already has `max_queued` bytes waiting (a
-    /// subscriber slower than its publishers). QoS 1 messages enter the in-flight window, or
-    /// wait for room in it, or are dropped once `max_queued` bytes wait.
+    /// subscriber slower than its publishers). QoS 1 and 2 messages enter the in-flight window,
+    /// or wait for room in it, or are dropped once `max_queued` bytes wait. Messages that
+    /// expired, or larger than the client's maximum packet size, are dropped too.
     #[inline]
-    fn deliver(&mut self, ctx: &mut Context, id: u64, packet: &[u8], qos: u8) {
+    fn deliver(&mut self, ctx: &mut Context, id: u64, m: &Msg, options: u8) {
         if id & SESSION != 0 {
             let sid = (id & !SESSION) as u32;
-            self.contexts.as_ref().unwrap().borrow_mut().session_message(ctx, sid, packet, qos);
+            self.contexts.as_ref().unwrap().borrow_mut().session_message(ctx, sid, m, options);
             return;
         }
-        let (max_queued, max_inflight) = (self.max_queued, self.max_inflight);
+        let max_queued = self.max_queued;
         let Some(c) = self.get(id) else {
             if let Some(&(partition, sid, _)) = self.forwards.get(&id) {
                 let target = SESSION | sid as u64;
                 if partition == ctx.core() {
-                    self.deliver(ctx, target, packet, qos);
+                    self.deliver(ctx, target, m, options);
                 } else {
-                    ctx.send(
-                        actor(partition, CONNECTIONS),
-                        Deliver { packet: packet.to_vec(), conns: vec![(target, qos)] },
-                    );
+                    ctx.send(actor(partition, CONNECTIONS), Deliver { msg: m.clone(), conns: vec![(target, options)] });
                 }
             }
             return;
         };
+        let qos = options & 3;
+        let (v5, max_out, window) = (c.v5, c.max_out as usize, c.window);
         // 0: dropped, 1: waits for room in the window, 2: queued for sending.
         let outcome = if qos == 0 {
-            if c.out.len() >= max_queued {
+            let start = c.out.len();
+            let retain = options & RETAIN_AS_PUBLISHED != 0 && m.retained;
+            if start >= max_queued || !encode_msg(&mut c.out, m, 0, 0, v5, retain) {
+                0
+            } else if max_out > 0 && c.out.len() - start > max_out {
+                c.out.truncate(start);
                 0
             } else {
-                c.out.extend_from_slice(packet);
                 2
             }
         } else {
             let ob = c.outbound.get_or_insert_with(Default::default);
-            if ob.inflight.len() < max_inflight {
-                ob.send(&mut c.out, packet, qos);
-                2
+            if ob.inflight.len() < window {
+                if ob.send(&mut c.out, m, options, v5, max_out) {
+                    2
+                } else {
+                    0
+                }
             } else if ob.pending_bytes + c.out.len() < max_queued {
-                ob.pending_bytes += packet.len();
-                ob.pending.push_back((qos, packet.to_vec()));
+                ob.pending_bytes += m.packet.len();
+                ob.pending.push_back((options, m.clone()));
                 1
             } else {
                 0
@@ -1289,17 +1582,16 @@ impl Connections {
     /// PUBACK or PUBCOMP from connection `id`: frees a slot of its window for the next pending
     /// message.
     fn acked(&mut self, ctx: &mut Context, id: u64, packet_id: u16) {
-        let max_inflight = self.max_inflight;
         let Some(c) = self.get(id) else { return };
+        let (v5, max_out, window) = (c.v5, c.max_out as usize, c.window);
         let Some(ob) = c.outbound.as_mut() else { return };
         let Some(at) = ob.inflight.iter().position(|(i, _)| *i == packet_id) else { return };
         ob.inflight.remove(at);
         let mut sent = false;
-        while ob.inflight.len() < max_inflight {
-            let Some((qos, next)) = ob.pending.pop_front() else { break };
-            ob.pending_bytes -= next.len();
-            ob.send(&mut c.out, &next, qos);
-            sent = true;
+        while ob.inflight.len() < window {
+            let Some((options, next)) = ob.pending.pop_front() else { break };
+            ob.pending_bytes -= next.packet.len();
+            sent |= ob.send(&mut c.out, &next, options, v5, max_out);
         }
         if sent {
             self.mark_dirty(ctx, id);
@@ -1423,19 +1715,28 @@ impl Actor for Connections {
     fn on_callback(&mut self, ctx: &mut Context) {
         self.callback_armed = false;
         let dirty = std::mem::take(&mut self.dirty);
+        let mut closing = Vec::new();
         for &id in &dirty {
             let Some(conn) = self.get(id) else { continue };
             conn.dirty = false;
             if conn.sending {
                 continue;
             }
-            let Ok(out) = take_output(conn, Vec::new()) else { continue };
+            let Ok(out) = take_output(conn, Vec::new()) else {
+                if conn.close_after_flush {
+                    closing.push(id); // nothing left to send
+                }
+                continue;
+            };
             conn.sending = true;
             let fd = conn.fd;
             ctx.io().unwrap().send(fd, out, token(SEND, id));
         }
         self.dirty = dirty;
         self.dirty.clear();
+        for id in closing {
+            self.close(ctx, id);
+        }
         for c in 0..self.consumed_from.len() {
             let bytes = std::mem::take(&mut self.consumed_from[c]);
             if bytes > 0 {
@@ -1492,7 +1793,7 @@ impl Handler<IoCompletion> for Connections {
 impl Handler<Deliver> for Connections {
     fn on_event(&mut self, ctx: &mut Context, src: ActorId, d: &Deliver) {
         for &(id, qos) in &d.conns {
-            self.deliver(ctx, id, &d.packet, qos);
+            self.deliver(ctx, id, &d.msg, qos);
         }
         if src.index == CONNECTIONS && src.core as CoreId != ctx.core() {
             let c = src.core as usize;
@@ -1518,6 +1819,7 @@ impl Handler<DeliverAck> for Connections {
 
 impl Handler<Opened> for Connections {
     fn on_event(&mut self, ctx: &mut Context, _src: ActorId, o: &Opened) {
+        let max_packet = self.max_packet.min(u32::MAX as usize) as u32;
         let Some(conn) = self.get(o.conn) else {
             // Closed meanwhile (it parked an empty session): hand the session back.
             if o.present {
@@ -1530,12 +1832,23 @@ impl Handler<Opened> for Connections {
                 };
                 ctx.send(
                     actor(partition, CONTEXT),
-                    Park { client_id, sub: (ctx.core() as u16, o.conn), filters: None, state },
+                    Park { client_id, sub: (ctx.core() as u16, o.conn), filters: None, state, expiry: u32::MAX },
                 );
             }
             return;
         };
-        codec::connack(&mut conn.out, o.present, 0);
+        if conn.v5 {
+            let mut props = Vec::new();
+            codec::prop_u16(&mut props, prop::TOPIC_ALIAS_MAXIMUM, TOPIC_ALIAS_MAX);
+            codec::prop_u32(&mut props, prop::MAXIMUM_PACKET_SIZE, max_packet);
+            codec::prop_u8(&mut props, prop::SUBSCRIPTION_IDS_AVAILABLE, 0);
+            if conn.assigned_id {
+                codec::prop_str(&mut props, prop::ASSIGNED_CLIENT_ID, &o.client_id);
+            }
+            codec::connack_v5(&mut conn.out, o.present, reason::SUCCESS, &props);
+        } else {
+            codec::connack(&mut conn.out, o.present, 0);
+        }
         conn.session = Some(o.sid);
         let held = conn.held.take().unwrap_or_default();
         let core = ctx.core() as u16;
@@ -1546,7 +1859,6 @@ impl Handler<Opened> for Connections {
             self.add_sub(ctx, filter, (core, o.conn), *qos);
             self.remove_sub(ctx, filter, target);
         }
-        let max_inflight = self.max_inflight;
         let conn = self.get(o.conn).unwrap();
         conn.filters = o.filters.clone();
         if !o.state.inflight.is_empty() || !o.state.queue.is_empty() || !o.state.received.is_empty() {
@@ -1564,12 +1876,13 @@ impl Handler<Opened> for Connections {
                 }
                 ob.last_id = ob.last_id.max(*pid);
             }
-            for (qos, packet) in &o.state.queue {
-                if ob.inflight.len() < max_inflight {
-                    ob.send(&mut conn.out, packet, *qos);
+            let (v5, max_out, window) = (conn.v5, conn.max_out as usize, conn.window);
+            for (options, m) in &o.state.queue {
+                if ob.inflight.len() < window {
+                    ob.send(&mut conn.out, m, *options, v5, max_out);
                 } else {
-                    ob.pending_bytes += packet.len();
-                    ob.pending.push_back((*qos, packet.clone()));
+                    ob.pending_bytes += m.packet.len();
+                    ob.pending.push_back((*options, m.clone()));
                 }
             }
         }
@@ -1616,16 +1929,22 @@ impl Handler<Stats> for Connections {
         for (name, value) in values {
             let topic = format!("$SYS/broker/{name}");
             let partition = self.topology.partition(&topic);
-            let retain = Retain { topic: topic.as_str().into(), payload: value.clone().into_bytes(), qos: 0 };
+            let retain = Retain {
+                topic: topic.as_str().into(),
+                payload: value.clone().into_bytes(),
+                qos: 0,
+                props: Vec::new(),
+                expires: None,
+            };
             ctx.send(actor(partition, CONTEXT), retain);
-            self.publish(ctx, &topic, value.as_bytes(), 0);
+            self.publish(ctx, &topic, value.as_bytes(), 0, &[], None, true, None);
         }
     }
 }
 
 impl Handler<Kick> for Connections {
     fn on_event(&mut self, ctx: &mut Context, _src: ActorId, k: &Kick) {
-        self.close(ctx, k.conn);
+        self.disconnect(ctx, k.conn, reason::SESSION_TAKEN_OVER);
     }
 }
 
@@ -1789,7 +2108,7 @@ fn restore(config: &Config, topology: &Topology) -> std::io::Result<Vec<Saved>> 
     let (saved, paths) = persist::load_dir(dir)?;
     let index = |key: &str| topology.cores.iter().position(|&c| c == topology.partition(key)).unwrap();
     for r in saved.retained {
-        parts[index(&r.0)].retained.push(r);
+        parts[index(&r.topic)].retained.push(r);
     }
     for x in saved.sessions {
         parts[index(&x.client_id)].sessions.push(x);

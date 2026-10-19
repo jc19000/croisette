@@ -26,6 +26,15 @@ pub struct Client {
     qos2: Vec<u16>,
     /// TLS over `stream`, if connected with `connect_tls`.
     tls: Option<Box<rustls::ClientConnection>>,
+    /// MQTT 5 connection (CONNECT level 5).
+    pub v5: bool,
+    /// MQTT 5: the CONNACK's properties, and those of the last message `next_publish` returned
+    /// with its message expiry interval.
+    pub connack_props: Vec<u8>,
+    pub last_props: Vec<u8>,
+    pub last_expiry: Option<u32>,
+    /// Reason code of the last acknowledgement or SUBACK/UNSUBACK codes read.
+    pub last_codes: Vec<u8>,
 }
 
 /// A TLS client configuration trusting the CA certificates of a PEM file's contents.
@@ -96,17 +105,25 @@ impl Client {
             last_dup: false,
             qos2: Vec::new(),
             tls,
+            v5: connect.level == 5,
+            connack_props: Vec::new(),
+            last_props: Vec::new(),
+            last_expiry: None,
+            last_codes: Vec::new(),
         };
         codec::connect_with(&mut c.out, connect);
         c.flush()?;
         let mut ack = None;
+        let mut props = Vec::new();
         c.read_packet(|p| match p {
-            Packet::ConnAck { session_present, code } => {
+            Packet::ConnAck { session_present, code, props: pr } => {
                 ack = Some((*session_present, *code));
+                props = pr.to_vec();
                 true
             }
             _ => false,
         })?;
+        c.connack_props = props;
         match ack {
             Some((session_present, 0)) => Ok((c, session_present)),
             Some((_, code)) => Err(io::Error::new(io::ErrorKind::ConnectionRefused, format!("CONNACK code {code}"))),
@@ -116,8 +133,29 @@ impl Client {
 
     /// Sends DISCONNECT (the broker then drops the will) and closes.
     pub fn disconnect(mut self) -> io::Result<()> {
-        codec::disconnect(&mut self.out);
+        if self.v5 {
+            codec::disconnect_v5(&mut self.out, 0);
+        } else {
+            codec::disconnect(&mut self.out);
+        }
         self.flush()
+    }
+
+    /// MQTT 5 DISCONNECT with a reason code and properties (e.g. a new session expiry).
+    pub fn disconnect_with(mut self, reason: u8, props: &[u8]) -> io::Result<()> {
+        self.out.push(0xe0);
+        let mut body = vec![reason];
+        codec::put_varint(&mut body, props.len());
+        body.extend_from_slice(props);
+        codec::put_varint(&mut self.out, body.len());
+        self.out.extend_from_slice(&body);
+        self.flush()
+    }
+
+    /// The client id the broker assigned (MQTT 5, empty client id).
+    pub fn assigned_client_id(&self) -> Option<String> {
+        let v = codec::prop_value(&self.connack_props, codec::prop::ASSIGNED_CLIENT_ID)?;
+        Some(String::from_utf8_lossy(v).into_owned())
     }
 
     /// Sends PINGREQ and waits for PINGRESP.
@@ -140,8 +178,24 @@ impl Client {
     /// Queues a PUBLISH; call `flush` to send queued packets.
     /// Returns the packet id (QoS 1 and 2).
     pub fn queue_publish(&mut self, topic: &str, payload: &[u8], qos: u8, retain: bool) -> Option<u16> {
+        self.queue_publish_with(topic, payload, qos, retain, &[])
+    }
+
+    /// `queue_publish` with MQTT 5 properties (encoded, see `codec::prop_*`).
+    pub fn queue_publish_with(
+        &mut self,
+        topic: &str,
+        payload: &[u8],
+        qos: u8,
+        retain: bool,
+        props: &[u8],
+    ) -> Option<u16> {
         let id = if qos > 0 { Some(self.id()) } else { None };
-        codec::publish(&mut self.out, topic, payload, qos, retain, id);
+        if self.v5 {
+            codec::publish_v5(&mut self.out, topic, payload, qos, retain, id, props);
+        } else {
+            codec::publish(&mut self.out, topic, payload, qos, retain, id);
+        }
         id
     }
 
@@ -196,9 +250,19 @@ impl Client {
 
     /// Subscribes at QoS `qos`, waits for the SUBACK and returns the granted QoS.
     pub fn subscribe_qos(&mut self, filters: &[&str], qos: u8) -> io::Result<Vec<u8>> {
-        let id = self.id();
         let f: Vec<(&str, u8)> = filters.iter().map(|f| (*f, qos)).collect();
-        codec::subscribe(&mut self.out, id, &f);
+        self.subscribe_with(&f)
+    }
+
+    /// Subscribes with an options byte per filter (QoS; MQTT 5 No Local, Retain As Published,
+    /// Retain Handling) and returns the SUBACK codes.
+    pub fn subscribe_with(&mut self, f: &[(&str, u8)]) -> io::Result<Vec<u8>> {
+        let id = self.id();
+        if self.v5 {
+            codec::subscribe_v5(&mut self.out, id, f);
+        } else {
+            codec::subscribe(&mut self.out, id, f);
+        }
         self.flush()?;
         let mut granted = Vec::new();
         self.read_packet(|p| match p {
@@ -213,7 +277,11 @@ impl Client {
 
     pub fn unsubscribe(&mut self, filters: &[&str]) -> io::Result<()> {
         let id = self.id();
-        codec::unsubscribe(&mut self.out, id, filters);
+        if self.v5 {
+            codec::unsubscribe_v5(&mut self.out, id, filters);
+        } else {
+            codec::unsubscribe(&mut self.out, id, filters);
+        }
         self.flush()?;
         self.read_packet(|p| matches!(p, Packet::UnsubAck { .. }))?;
         Ok(())
@@ -235,16 +303,16 @@ impl Client {
     /// Next PUBLISH from the broker, blocking.
     pub fn next_publish(&mut self) -> io::Result<Incoming> {
         enum Got {
-            Msg(Incoming, u8, Option<u16>, bool),
+            Msg(Incoming, u8, Option<u16>, bool, Vec<u8>, Option<u32>),
             Rel(u16),
             Other(String),
         }
         loop {
             let got = self.try_parse(|p| {
                 Some(match p {
-                    Packet::Publish { topic, payload, qos, retain, packet_id, dup } => {
+                    Packet::Publish { topic, payload, qos, retain, packet_id, dup, props, expiry, .. } => {
                         let m = Incoming::Publish { topic: topic.to_string(), payload: payload.to_vec(), qos, retain };
-                        Got::Msg(m, qos, packet_id, dup)
+                        Got::Msg(m, qos, packet_id, dup, props.to_vec(), expiry)
                     }
                     Packet::PubRel { packet_id } => Got::Rel(packet_id),
                     other => Got::Other(format!("{other:?}")),
@@ -254,9 +322,11 @@ impl Client {
                 None => {}
                 Some(Got::Rel(id)) => self.released(id)?,
                 Some(Got::Other(s)) => return Ok(Incoming::Other(s)),
-                Some(Got::Msg(m, qos, packet_id, dup)) => {
+                Some(Got::Msg(m, qos, packet_id, dup, props, expiry)) => {
                     self.last_packet_id = packet_id;
                     self.last_dup = dup;
+                    self.last_props = props;
+                    self.last_expiry = expiry;
                     if self.on_publish(qos, packet_id.unwrap_or(0)) {
                         self.send_acks()?;
                         return Ok(m);
@@ -304,7 +374,9 @@ impl Client {
     pub fn read_publishes(&mut self, mut on_publish: impl FnMut(&[u8])) -> io::Result<usize> {
         self.fill()?;
         let mut n = 0;
-        while let Some((packet, len)) = codec::parse(&self.buf[self.start..]).map_err(io::Error::other)? {
+        while let Some((packet, len)) =
+            codec::parse_limited(&self.buf[self.start..], codec::MAX_PACKET, self.v5).map_err(io::Error::other)?
+        {
             match packet {
                 Packet::Publish { payload, qos, packet_id, .. } => {
                     let pid = packet_id.unwrap_or(0);
@@ -367,7 +439,7 @@ impl Client {
 
     fn try_parse<T>(&mut self, mut f: impl FnMut(Packet<'_>) -> Option<T>) -> io::Result<Option<T>> {
         loop {
-            match codec::parse(&self.buf[self.start..]).map_err(io::Error::other)? {
+            match codec::parse_limited(&self.buf[self.start..], codec::MAX_PACKET, self.v5).map_err(io::Error::other)? {
                 Some((packet, len)) => {
                     self.start += len;
                     if let Some(t) = f(packet) {

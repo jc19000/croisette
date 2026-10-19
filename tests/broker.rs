@@ -180,7 +180,7 @@ fn with_will<'a>(id: &'a str, topic: &'a str, retain: bool, keep_alive: u16) -> 
         client_id: id,
         keep_alive,
         clean_session: true,
-        will: Some(Will { topic, payload: b"gone", qos: 0, retain }),
+        will: Some(Will { topic, payload: b"gone", qos: 0, retain, ..Will::default() }),
         ..Connect::default()
     }
 }
@@ -250,7 +250,7 @@ fn connect_is_validated() {
     let _g = serial();
     let (engine, addr) = start(vec![1, 2]);
     let refused = |c: &Connect<'_>| Client::connect_with(addr, c).err().map(|e| (e.kind(), e.to_string()));
-    let bad_level = Connect { level: 5, client_id: "x", clean_session: true, ..Connect::default() };
+    let bad_level = Connect { level: 6, client_id: "x", clean_session: true, ..Connect::default() };
     assert_eq!(refused(&bad_level), Some((std::io::ErrorKind::ConnectionRefused, "CONNACK code 1".into())));
     let no_id = Connect { level: 4, client_id: "", clean_session: false, ..Connect::default() };
     assert_eq!(refused(&no_id), Some((std::io::ErrorKind::ConnectionRefused, "CONNACK code 2".into())));
@@ -659,7 +659,11 @@ fn no_message_lost_across_reconnections(qos: u8) {
     }
     publisher.join().unwrap();
     assert_eq!(reconnects, 20);
-    assert!(redelivered > 0, "reconnections happened with unacknowledged messages");
+    // QoS 1 publishers pipeline, so some reconnections find unacknowledged messages; QoS 2
+    // ones go one message at a time and may not.
+    if qos == 1 {
+        assert!(redelivered > 0, "reconnections happened with unacknowledged messages");
+    }
     engine.shutdown();
 }
 
@@ -959,7 +963,7 @@ fn retained_and_sessions_survive_a_restart() {
     // The periodic snapshot has the retained message.
     std::thread::sleep(Duration::from_millis(2500));
     let (saved, _) = croisette::persist::load_dir(&dir).unwrap();
-    assert!(saved.retained.iter().any(|r| r.0 == "r/x"), "{saved:?}");
+    assert!(saved.retained.iter().any(|r| r.topic == "r/x"), "{saved:?}");
     engine.shutdown(); // writes the final snapshots
     drop((p, online));
 
@@ -1132,4 +1136,192 @@ impl<S: Read + Write> WsSend for WsClient<S> {
     fn send_mqtt(&mut self, b: &[u8]) {
         self.send(b)
     }
+}
+
+// ---- MQTT 5 -------------------------------------------------------------------------------------
+
+fn v5(addr: SocketAddr, id: &str, session_expiry: Option<u32>, clean: bool) -> (Client, bool) {
+    let c =
+        Connect { level: 5, client_id: id, keep_alive: 60, clean_session: clean, session_expiry, ..Connect::default() };
+    let (client, present) = Client::connect_with(addr, &c).unwrap();
+    client.set_timeout(Some(Duration::from_secs(5))).unwrap();
+    (client, present)
+}
+
+fn content_type(ct: &str) -> Vec<u8> {
+    let mut p = Vec::new();
+    codec::prop_str(&mut p, 0x03, ct);
+    p
+}
+
+#[test]
+fn mqtt5_and_mqtt311_clients_share_messages() {
+    let _g = serial();
+    let (engine, addr) = start(vec![1, 2]);
+    let (mut s5, _) = v5(addr, "s5", None, true);
+    assert_eq!(s5.subscribe_qos(&["m/#"], 2).unwrap(), vec![2]);
+    let mut s3 = client(addr, "s3");
+    s3.subscribe_qos(&["m/#"], 1).unwrap();
+    let (mut p5, _) = v5(addr, "p5", None, true);
+    p5.queue_publish_with("m/a", b"json", 1, false, &content_type("application/json"));
+    p5.flush().unwrap();
+    assert_eq!(s5.next_publish().unwrap(), qos1_msg("m/a", b"json", false));
+    assert_eq!(codec::prop_value(&s5.last_props, 0x03), Some(&b"application/json"[..]), "properties forwarded");
+    assert_eq!(s3.next_publish().unwrap(), qos1_msg("m/a", b"json", false));
+    let mut p3 = client(addr, "p3");
+    p3.publish("m/b", b"old", 0, false).unwrap();
+    assert_eq!(s5.next_publish().unwrap(), publish_msg("m/b", b"old"));
+    assert!(s5.last_props.is_empty());
+    // The broker assigns a client id to an MQTT 5 client without one.
+    let (anon, _) = v5(addr, "", None, true);
+    assert!(anon.assigned_client_id().is_some_and(|id| id.starts_with("croisette-")), "{:?}", anon.connack_props);
+    assert_eq!(codec::prop_value(&anon.connack_props, codec::prop::TOPIC_ALIAS_MAXIMUM), Some(&[0, 64][..]));
+    // Topic aliases from the client.
+    let mut alias = Vec::new();
+    codec::prop_u16(&mut alias, codec::prop::TOPIC_ALIAS, 7);
+    p5.queue_publish_with("m/aliased", b"1", 0, false, &alias);
+    p5.queue_publish_with("", b"2", 0, false, &alias);
+    p5.flush().unwrap();
+    assert_eq!(s5.next_publish().unwrap(), publish_msg("m/aliased", b"1"));
+    assert_eq!(s5.next_publish().unwrap(), publish_msg("m/aliased", b"2"));
+    engine.shutdown();
+}
+
+#[test]
+fn mqtt5_subscription_options() {
+    let _g = serial();
+    let (engine, addr) = start(vec![1, 2]);
+    let mut p = client(addr, "p");
+    p.publish("keep", b"retained", 0, true).unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    let (mut c, _) = v5(addr, "c", None, true);
+    // No Local: its own messages do not come back.
+    c.subscribe_with(&[("nl", 0x04)]).unwrap();
+    c.publish("nl", b"mine", 0, false).unwrap();
+    p.publish("nl", b"theirs", 0, false).unwrap();
+    assert_eq!(c.next_publish().unwrap(), publish_msg("nl", b"theirs"));
+    // Retain Handling 2: no retained message; 1: only for a new subscription.
+    c.subscribe_with(&[("keep", 0x20)]).unwrap();
+    assert_nothing(&mut c);
+    c.unsubscribe(&["keep"]).unwrap();
+    c.subscribe_with(&[("keep", 0x10)]).unwrap();
+    assert_eq!(
+        c.next_publish().unwrap(),
+        Incoming::Publish { topic: "keep".into(), payload: b"retained".to_vec(), qos: 0, retain: true }
+    );
+    c.subscribe_with(&[("keep", 0x10)]).unwrap();
+    assert_nothing(&mut c);
+    // Retain As Published: the retain flag of a live message is kept.
+    let (mut rap, _) = v5(addr, "rap", None, true);
+    rap.subscribe_with(&[("live", 0x08 | 0x20)]).unwrap();
+    let (mut plain, _) = v5(addr, "plain", None, true);
+    plain.subscribe_with(&[("live", 0x20)]).unwrap();
+    p.publish("live", b"x", 0, true).unwrap();
+    let live = |retain| Incoming::Publish { topic: "live".into(), payload: b"x".to_vec(), qos: 0, retain };
+    assert_eq!(rap.next_publish().unwrap(), live(true));
+    assert_eq!(plain.next_publish().unwrap(), live(false));
+    engine.shutdown();
+}
+
+#[test]
+fn mqtt5_expiry_and_flow_control() {
+    let _g = serial();
+    let (engine, addr) = start(vec![1, 2]);
+    let expiry = |secs: u32| {
+        let mut p = Vec::new();
+        codec::prop_u32(&mut p, codec::prop::MESSAGE_EXPIRY, secs);
+        p
+    };
+    // Session expiry: an offline session with a 1 s expiry is gone after it.
+    let (mut dev, _) = v5(addr, "dev", Some(1), true);
+    dev.subscribe_qos(&["e/#"], 1).unwrap();
+    dev.disconnect().unwrap();
+    let (mut p, _) = v5(addr, "p", None, true);
+    p.queue_publish_with("e/short", b"expires", 1, false, &expiry(1));
+    p.queue_publish_with("e/long", b"stays", 1, false, &expiry(600));
+    p.queue_publish_with("ret", b"old", 0, true, &expiry(1));
+    p.flush().unwrap();
+    let (mut keep, _) = v5(addr, "keep", Some(600), true);
+    keep.subscribe_qos(&["e/#"], 1).unwrap();
+    keep.disconnect().unwrap();
+    p.queue_publish_with("e/short", b"expires", 1, false, &expiry(1));
+    p.queue_publish_with("e/long", b"stays", 1, false, &expiry(600));
+    p.flush().unwrap();
+    std::thread::sleep(Duration::from_millis(3200));
+    let (_dev, present) = v5(addr, "dev", Some(1), false);
+    assert!(!present, "the session expired");
+    // Message expiry: the queued message past its expiry is dropped, the other keeps the rest
+    // of its interval.
+    let (mut keep, present) = v5(addr, "keep", Some(600), false);
+    assert!(present);
+    assert_eq!(keep.next_publish().unwrap(), qos1_msg("e/long", b"stays", false));
+    assert!(keep.last_expiry.is_some_and(|e| (590..600).contains(&e)), "{:?}", keep.last_expiry);
+    assert_nothing(&mut keep);
+    let mut late = client(addr, "late");
+    late.subscribe(&["ret"]).unwrap();
+    assert_nothing(&mut late); // the retained message expired
+                               // Receive Maximum: at most 2 unacknowledged QoS 1 messages to this client.
+    let c =
+        Connect { level: 5, client_id: "slow", clean_session: true, receive_maximum: Some(2), ..Connect::default() };
+    let (mut slow, _) = Client::connect_with(addr, &c).unwrap();
+    slow.set_timeout(Some(Duration::from_secs(5))).unwrap();
+    slow.auto_ack = false;
+    slow.subscribe_qos(&["w"], 1).unwrap();
+    for i in 0..5u8 {
+        p.publish("w", &[i], 1, false).unwrap();
+    }
+    assert_eq!(slow.next_publish().unwrap(), qos1_msg("w", &[0], false));
+    assert_eq!(slow.next_publish().unwrap(), qos1_msg("w", &[1], false));
+    assert_nothing(&mut slow);
+    // Maximum Packet Size: larger messages are not sent to this client.
+    let c = Connect {
+        level: 5,
+        client_id: "small",
+        clean_session: true,
+        maximum_packet_size: Some(100),
+        ..Connect::default()
+    };
+    let (mut small, _) = Client::connect_with(addr, &c).unwrap();
+    small.set_timeout(Some(Duration::from_secs(5))).unwrap();
+    small.subscribe(&["sz"]).unwrap();
+    p.publish("sz", &[0u8; 200], 0, false).unwrap();
+    p.publish("sz", b"fits", 0, false).unwrap();
+    assert_eq!(small.next_publish().unwrap(), publish_msg("sz", b"fits"));
+    engine.shutdown();
+}
+
+#[test]
+fn mqtt5_disconnects_with_reason_codes() {
+    let _g = serial();
+    let (engine, addr) = start(vec![1, 2]);
+    // Takeover: the first connection gets DISCONNECT Session taken over (0x8E).
+    let (mut first, _) = v5(addr, "twin", Some(60), true);
+    let (_second, present) = v5(addr, "twin", Some(60), false);
+    assert!(present);
+    match first.next_publish().unwrap() {
+        Incoming::Other(p) => assert!(p.contains("Disconnect { reason: 142"), "{p}"),
+        other => panic!("{other:?}"),
+    }
+    // A DISCONNECT that sets the session expiry to 0 ends the session.
+    let (dev, _) = v5(addr, "dev", Some(600), true);
+    let mut props = Vec::new();
+    codec::prop_u32(&mut props, codec::prop::SESSION_EXPIRY, 0);
+    dev.disconnect_with(0, &props).unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    let (_dev, present) = v5(addr, "dev", Some(600), false);
+    assert!(!present);
+    // Reason 0x04 (disconnect with will message) publishes the will.
+    let mut watcher = client(addr, "watcher");
+    watcher.subscribe(&["wills/#"]).unwrap();
+    let c = Connect {
+        level: 5,
+        client_id: "w",
+        clean_session: true,
+        will: Some(Will { topic: "wills/w", payload: b"bye", ..Will::default() }),
+        ..Connect::default()
+    };
+    let (w, _) = Client::connect_with(addr, &c).unwrap();
+    w.disconnect_with(0x04, &[]).unwrap();
+    assert_eq!(watcher.next_publish().unwrap(), publish_msg("wills/w", b"bye"));
+    engine.shutdown();
 }

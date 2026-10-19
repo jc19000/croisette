@@ -59,6 +59,22 @@ wait $A $B
 check "shared subscription" "4" "$(cat "$DIR/sh1" "$DIR/sh2" | sort -u | wc -l | tr -d ' ')"
 stop
 
+start
+mosquitto_sub -p $PORT -V mqttv5 -t 'v5/#' -C 2 -W 3 -F '%t %p %P' > "$DIR/v5" & S=$!
+sleep 0.3
+mosquitto_pub -p $PORT -V mqttv5 -t v5/a -m hello -q 1 -D publish user-property color blue
+mosquitto_pub -p $PORT -V mqttv311 -t v5/b -m old -q 2
+wait $S
+check "MQTT 5 user property forwarded" "v5/a hello color:blue" "$(head -1 "$DIR/v5")"
+check "MQTT 3.1.1 publisher, MQTT 5 subscriber" "v5/b old" "$(sed -n 2p "$DIR/v5" | sed 's/ $//')"
+mosquitto_sub -p $PORT -V mqttv5 -t v5s -q 1 -C 1 -W 1 -i v5sess -c -x 60 > /dev/null 2>&1
+mosquitto_pub -p $PORT -V mqttv5 -t v5s -m queued -q 1
+check "MQTT 5 session expiry interval" "queued" "$(sub -V mqttv5 -t v5s -q 1 -C 1 -W 2 -i v5sess -c -x 60)"
+mosquitto_pub -p $PORT -V mqttv5 -t v5r -m kept -r -D publish message-expiry-interval 1
+sleep 2.2
+check "MQTT 5 message expiry of a retained message" "" "$(sub -V mqttv5 -t v5r -C 1 -W 1 | grep -v Timed)"
+stop
+
 start --tls-cert tests/data/cert.pem --tls-key tests/data/key.pem --tls-port $((PORT + 1))
 mosquitto_sub -p $((PORT + 1)) --cafile tests/data/ca.pem -t tls/x -C 1 -W 3 > "$DIR/tls" & S=$!
 sleep 0.3

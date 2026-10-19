@@ -10,22 +10,48 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-const MAGIC: &[u8; 8] = b"CRSTDB1\n";
+const MAGIC: &[u8; 8] = b"CRSTDB2\n";
+
+/// A message as it travels between tiers and waits in queues: its QoS 0 MQTT 3.1.1 encoding
+/// (with the retain flag for retained deliveries), and what MQTT 5 receivers also get.
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
+pub struct Msg {
+    pub packet: Vec<u8>,
+    /// MQTT 5 properties to forward (user properties, content type, response topic...).
+    pub props: Vec<u8>,
+    /// UNIX time (seconds) after which the message is dropped (MQTT 5 message expiry).
+    pub expires: Option<u64>,
+    /// Published with the retain flag (for Retain As Published subscriptions).
+    pub retained: bool,
+}
+
+#[derive(Default, Debug, PartialEq, Eq)]
+pub struct SavedRetained {
+    pub topic: String,
+    pub payload: Vec<u8>,
+    pub qos: u8,
+    pub props: Vec<u8>,
+    pub expires: Option<u64>,
+}
 
 #[derive(Default, Debug, PartialEq, Eq)]
 pub struct Saved {
-    pub retained: Vec<(String, Vec<u8>, u8)>,
+    pub retained: Vec<SavedRetained>,
     pub sessions: Vec<SavedSession>,
 }
 
 #[derive(Default, Debug, PartialEq, Eq)]
 pub struct SavedSession {
     pub client_id: String,
+    /// Session expiry interval, seconds (u32::MAX: never), and when it went offline (UNIX time).
+    pub expiry: u32,
+    pub offline_since: u64,
+    /// Filters and their subscription options.
     pub filters: Vec<(String, u8)>,
     /// Packet id and encoding (empty: at the PUBREL step).
     pub inflight: Vec<(u16, Vec<u8>)>,
-    /// QoS and QoS 0 encoding.
-    pub queue: Vec<(u8, Vec<u8>)>,
+    /// Delivery options (QoS...) and message.
+    pub queue: Vec<(u8, Msg)>,
     /// QoS 2 ids received from the client and not released.
     pub received: Vec<u16>,
 }
@@ -42,6 +68,19 @@ impl Writer {
     }
     fn u16(&mut self, v: u16) {
         self.0.extend_from_slice(&v.to_le_bytes());
+    }
+    fn u64(&mut self, v: u64) {
+        self.0.extend_from_slice(&v.to_le_bytes());
+    }
+    fn opt_u64(&mut self, v: Option<u64>) {
+        self.u8(v.is_some() as u8);
+        self.u64(v.unwrap_or(0));
+    }
+    fn msg(&mut self, m: &Msg) {
+        self.bytes(&m.packet);
+        self.bytes(&m.props);
+        self.opt_u64(m.expires);
+        self.u8(m.retained as u8);
     }
     fn u32(&mut self, v: usize) {
         self.0.extend_from_slice(&(v as u32).to_le_bytes());
@@ -76,6 +115,17 @@ impl Reader<'_> {
     fn u32(&mut self) -> io::Result<usize> {
         Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()) as usize)
     }
+    fn u64(&mut self) -> io::Result<u64> {
+        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    }
+    fn opt_u64(&mut self) -> io::Result<Option<u64>> {
+        let some = self.u8()? != 0;
+        let v = self.u64()?;
+        Ok(some.then_some(v))
+    }
+    fn msg(&mut self) -> io::Result<Msg> {
+        Ok(Msg { packet: self.bytes()?, props: self.bytes()?, expires: self.opt_u64()?, retained: self.u8()? != 0 })
+    }
     fn bytes(&mut self) -> io::Result<Vec<u8>> {
         let n = self.u32()?;
         Ok(self.take(n)?.to_vec())
@@ -88,14 +138,18 @@ impl Reader<'_> {
 pub fn encode(s: &Saved) -> Vec<u8> {
     let mut w = Writer(MAGIC.to_vec());
     w.u32(s.retained.len());
-    for (topic, payload, qos) in &s.retained {
-        w.bytes(topic.as_bytes());
-        w.bytes(payload);
-        w.u8(*qos);
+    for r in &s.retained {
+        w.bytes(r.topic.as_bytes());
+        w.bytes(&r.payload);
+        w.u8(r.qos);
+        w.bytes(&r.props);
+        w.opt_u64(r.expires);
     }
     w.u32(s.sessions.len());
     for x in &s.sessions {
         w.bytes(x.client_id.as_bytes());
+        w.u32(x.expiry as usize);
+        w.u64(x.offline_since);
         w.u32(x.filters.len());
         for (f, q) in &x.filters {
             w.bytes(f.as_bytes());
@@ -107,9 +161,9 @@ pub fn encode(s: &Saved) -> Vec<u8> {
             w.bytes(p);
         }
         w.u32(x.queue.len());
-        for (q, p) in &x.queue {
+        for (q, m) in &x.queue {
             w.u8(*q);
-            w.bytes(p);
+            w.msg(m);
         }
         w.u32(x.received.len());
         for id in &x.received {
@@ -126,10 +180,21 @@ pub fn decode(data: &[u8]) -> io::Result<Saved> {
     }
     let mut s = Saved::default();
     for _ in 0..r.u32()? {
-        s.retained.push((r.string()?, r.bytes()?, r.u8()?));
+        s.retained.push(SavedRetained {
+            topic: r.string()?,
+            payload: r.bytes()?,
+            qos: r.u8()?,
+            props: r.bytes()?,
+            expires: r.opt_u64()?,
+        });
     }
     for _ in 0..r.u32()? {
-        let mut x = SavedSession { client_id: r.string()?, ..SavedSession::default() };
+        let mut x = SavedSession {
+            client_id: r.string()?,
+            expiry: r.u32()? as u32,
+            offline_since: r.u64()?,
+            ..SavedSession::default()
+        };
         for _ in 0..r.u32()? {
             x.filters.push((r.string()?, r.u8()?));
         }
@@ -137,7 +202,7 @@ pub fn decode(data: &[u8]) -> io::Result<Saved> {
             x.inflight.push((r.u16()?, r.bytes()?));
         }
         for _ in 0..r.u32()? {
-            x.queue.push((r.u8()?, r.bytes()?));
+            x.queue.push((r.u8()?, r.msg()?));
         }
         for _ in 0..r.u32()? {
             x.received.push(r.u16()?);
@@ -185,12 +250,20 @@ mod tests {
     #[test]
     fn roundtrip() {
         let s = Saved {
-            retained: vec![("a/b".into(), b"v".to_vec(), 1)],
+            retained: vec![SavedRetained {
+                topic: "a/b".into(),
+                payload: b"v".to_vec(),
+                qos: 1,
+                props: vec![3, 0, 1, b'x'],
+                expires: Some(99),
+            }],
             sessions: vec![SavedSession {
                 client_id: "dev".into(),
+                expiry: 3600,
+                offline_since: 12,
                 filters: vec![("cmd/#".into(), 1), ("x".into(), 2)],
                 inflight: vec![(7, b"pkt".to_vec()), (8, Vec::new())],
-                queue: vec![(2, b"q".to_vec())],
+                queue: vec![(2, Msg { packet: b"q".to_vec(), props: Vec::new(), expires: None, retained: true })],
                 received: vec![3, 4],
             }],
         };
