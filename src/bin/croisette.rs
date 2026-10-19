@@ -7,6 +7,7 @@
 //!
 //! MODE: `spin`, `adaptive` (2000 idle loops, then 50 µs sleeps), `adaptive:<loops>:<µs>`,
 //! `sleep:<µs>` (wait in io_uring after each idle iteration, an I/O completion ends the wait).
+//! Default: `sleep:100000` on one core, `adaptive` on several.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -27,6 +28,7 @@ fn main() {
         return;
     }
     let (mut passwd, mut acl, mut anonymous) = (None, None, true);
+    let mut mode = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         let value = args.next().unwrap_or_else(|| panic!("{arg} needs a value"));
@@ -36,7 +38,7 @@ fn main() {
             "--mode" => {
                 let us = |v: &str| Duration::from_micros(v.parse().expect("microseconds"));
                 let parts: Vec<&str> = value.split(':').collect();
-                config.mode = match parts[..] {
+                mode = Some(match parts[..] {
                     ["spin"] => CoreMode::Spin,
                     ["adaptive"] => broker::adaptive(),
                     ["adaptive", loops, sleep] => {
@@ -44,7 +46,7 @@ fn main() {
                     }
                     ["sleep", sleep] => CoreMode::Sleep(us(sleep)),
                     _ => panic!("unknown mode {value}"),
-                }
+                })
             }
             "--max-queued" => config.max_queued = value.parse().expect("bytes"),
             "--max-packet" => config.max_packet = value.parse().expect("bytes"),
@@ -61,6 +63,13 @@ fn main() {
         let auth = Auth::load(passwd.as_deref(), acl.as_deref(), anonymous).expect("password or ACL file");
         config.auth = Some(Arc::new(auth));
     }
+    // Default: one core waits in io_uring (nothing else can wake it, so no busy wait); several
+    // cores spin while busy and sleep briefly when idle, to see each other's events quickly.
+    config.mode = mode.unwrap_or(if config.cores.len() == 1 {
+        CoreMode::Sleep(Duration::from_millis(100))
+    } else {
+        broker::adaptive()
+    });
     let _engine = broker::start(&config).expect("broker start");
     eprintln!("croisette listening on port {} on cores {:?} ({:?})", config.port, config.cores, config.mode);
     loop {

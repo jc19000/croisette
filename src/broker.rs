@@ -34,7 +34,10 @@ const ROUTER: u32 = 0;
 const CONTEXT: u32 = 1;
 const CONNECTIONS: u32 = 2;
 
-const RECV_BUF: usize = 1024;
+/// Receive buffer sizes: a connection starts small (most are idle), its buffer doubles when a
+/// recv fills it and halves back when the traffic drops.
+const RECV_MIN: usize = 256;
+const RECV_MAX: usize = 64 << 10;
 
 fn actor(core: CoreId, index: u32) -> ActorId {
     ActorId { core: core as u16, generation: 0, index }
@@ -470,6 +473,8 @@ struct Conn {
     keep_alive: u16,
     /// Tick of the last bytes received (or of the accept before that).
     last_rx: u32,
+    /// Consecutive receives much smaller than the receive buffer.
+    quiet_rx: u8,
     will: Option<Box<OwnedWill>>,
     close_after_flush: bool,
     outbound: Option<Box<Outbound>>,
@@ -572,6 +577,7 @@ impl Connections {
             connected: false,
             keep_alive: 0,
             last_rx: self.tick,
+            quiet_rx: 0,
             will: None,
             close_after_flush: false,
             outbound: None,
@@ -587,7 +593,7 @@ impl Connections {
         });
         self.open += 1;
         let id = self.id(index);
-        ctx.io().unwrap().recv(fd, Vec::with_capacity(RECV_BUF), token(RECV, id));
+        ctx.io().unwrap().recv(fd, Vec::with_capacity(RECV_MIN), token(RECV, id));
     }
 
     /// Adds a subscription to this core's index and broadcasts it to the other cores.
@@ -667,6 +673,7 @@ impl Connections {
             return;
         }
         self.bytes_in += result as u64;
+        let filled = buf.len() == buf.capacity();
         let mut consumed = 0;
         loop {
             match codec::parse_limited(&buf[consumed..], self.max_packet) {
@@ -699,10 +706,25 @@ impl Connections {
             }
         }
         buf.drain(..consumed);
-        // Room for the rest of a large packet in one go, else for the next small ones.
-        let want = codec::packet_len(&buf).map_or(RECV_BUF, |n| n.saturating_sub(buf.len()).max(RECV_BUF / 2));
-        if buf.capacity() - buf.len() < want {
-            buf.reserve(want.max(RECV_BUF));
+        let cap = buf.capacity();
+        let small = (result as usize) < cap / 8;
+        let Some(conn) = self.get(id) else { return };
+        conn.quiet_rx = if small { conn.quiet_rx.saturating_add(1) } else { 0 };
+        let mut target = if filled {
+            (cap * 2).min(RECV_MAX)
+        } else if buf.is_empty() && cap > RECV_MIN && conn.quiet_rx >= 16 {
+            conn.quiet_rx = 0;
+            (cap / 2).max(RECV_MIN)
+        } else {
+            cap
+        };
+        // Room for the rest of a large packet in one go, and for a small one at least.
+        let rest = codec::packet_len(&buf).map_or(0, |n| n.saturating_sub(buf.len()));
+        target = target.max(buf.len() + rest.max(RECV_MIN / 2));
+        if target > cap {
+            buf.reserve(target - buf.len());
+        } else if target < cap && buf.is_empty() {
+            buf = Vec::with_capacity(target);
         }
         let tick = self.tick;
         let Some(conn) = self.get(id) else { return };
@@ -1286,7 +1308,7 @@ impl Default for Config {
             connect_timeout: Duration::from_secs(10),
             max_packet: codec::MAX_PACKET,
             max_queued: 4 << 20,
-            max_inflight: 32,
+            max_inflight: 128,
             sys_interval: Duration::from_secs(10),
             auth: None,
         }
