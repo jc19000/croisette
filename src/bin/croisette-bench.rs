@@ -12,7 +12,7 @@
 //! `schedstat` of all its threads, memory from `VmRSS`.
 //!
 //! usage: croisette-bench flow|idle --port P --broker-pid PID [--pubs N] [--subs N] [--rate R]
-//!        [--secs S] [--payload B] [--filter F] [--threads T] [--conns N]
+//!        [--secs S] [--payload B] [--filter F] [--threads T] [--qos Q] [--conns N]
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -133,12 +133,13 @@ fn flow(args: &Args, addr: SocketAddr, pid: u32) {
     let payload_len: usize = args.get::<usize>("payload", 64).max(8);
     let filter = args.string("filter", "bench/#");
     let threads: usize = args.get("threads", 1);
+    let qos: u8 = args.get("qos", 0);
 
     // Subscribers first, each subscribed before anyone publishes.
     let sub_clients: Vec<Client> = (0..subs)
         .map(|i| {
             let mut c = connect_retry(addr, &format!("bench-sub-{i}"));
-            c.subscribe(&[&filter]).unwrap();
+            c.subscribe_qos(&[&filter], qos).unwrap();
             c.stream.set_nonblocking(true).unwrap();
             c
         })
@@ -193,10 +194,19 @@ fn flow(args: &Args, addr: SocketAddr, pid: u32) {
             let ids: Vec<usize> = (0..pubs).filter(|i| i % writers_n == t).collect();
             let (stop, measuring, start, sent) = (stop.clone(), measuring.clone(), start.clone(), sent.clone());
             thread::spawn(move || {
-                let mut clients: Vec<(Client, String)> = ids
+                let clients: Vec<(Client, String)> = ids
                     .iter()
                     .map(|i| (connect_retry(addr, &format!("bench-pub-{i}")), format!("bench/{i}")))
                     .collect();
+                // PUBACKs of QoS 1 publishes are read and dropped by a helper thread.
+                for (c, _) in &clients {
+                    let mut acks = c.stream.try_clone().unwrap();
+                    thread::spawn(move || {
+                        let mut b = [0u8; 4096];
+                        while std::io::Read::read(&mut acks, &mut b).is_ok_and(|n| n > 0) {}
+                    });
+                }
+                let mut clients = clients;
                 let per_thread = rate / writers_n as f64;
                 let mut payload = vec![0u8; payload_len];
                 let mut rng = 0x9e37_79b9_7f4a_7c15u64 ^ t as u64;
@@ -212,7 +222,7 @@ fn flow(args: &Args, addr: SocketAddr, pid: u32) {
                             let len = clients.len();
                             let (c, topic) = &mut clients[next % len];
                             payload[..8].copy_from_slice(&due.to_le_bytes());
-                            c.queue_publish(topic, &payload, 0, false);
+                            c.queue_publish(topic, &payload, qos, false);
                             next += 1;
                             n += 1;
                             rng ^= rng << 13;
@@ -229,7 +239,7 @@ fn flow(args: &Args, addr: SocketAddr, pid: u32) {
                         let len = clients.len();
                         let (c, topic) = &mut clients[next % len];
                         for _ in 0..64 {
-                            c.queue_publish(topic, &payload, 0, false);
+                            c.queue_publish(topic, &payload, qos, false);
                         }
                         next += 1;
                         64
@@ -271,7 +281,7 @@ fn flow(args: &Args, addr: SocketAddr, pid: u32) {
     let el = elapsed.as_secs_f64();
     let cpu_s = (cpu1 - cpu0) as f64 / 1e9;
     println!(
-        "flow pubs={pubs} subs={subs} filter={filter} rate={rate} payload={payload_len} | sent/s={:.0} delivered/s={:.0} | broker cpu={:.2} cores, {:.2} cpu-s per million delivered, rss={} MB | latency us p50={} p99={} p99.9={} max={}",
+        "flow pubs={pubs} subs={subs} filter={filter} rate={rate} payload={payload_len} qos={qos} | sent/s={:.0} delivered/s={:.0} | broker cpu={:.2} cores, {:.2} cpu-s per million delivered, rss={} MB | latency us p50={} p99={} p99.9={} max={}",
         sent.load(Ordering::Relaxed) as f64 / el,
         received as f64 / el,
         cpu_s / el,

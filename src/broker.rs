@@ -17,7 +17,7 @@
 //! delivery is QoS 0; QoS 1 publishes are acknowledged once routed (no persistence); clean
 //! sessions only; keep-alive is not enforced.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::Ipv4Addr;
 use std::os::fd::RawFd;
 use std::sync::Arc;
@@ -26,7 +26,7 @@ use std::time::Duration;
 use cannes::{Actor, ActorId, ActorRef, Context, CoreId, CoreMode, Engine, Handler, IoCompletion, StartSequence};
 
 use crate::codec::{self, Packet};
-use crate::index::{Sub, SubIndex};
+use crate::index::{Entry, Sub, SubIndex};
 use crate::net;
 
 const ROUTER: u32 = 0;
@@ -59,6 +59,7 @@ impl Topology {
 struct SubAdd {
     filter: Box<str>,
     sub: Sub,
+    qos: u8,
 }
 
 struct SubRemove {
@@ -66,20 +67,23 @@ struct SubRemove {
     sub: Sub,
 }
 
-/// Encoded packets for connections of the receiving core.
+/// A message for connections of the receiving core: its QoS 0 encoding, and each connection with
+/// the QoS it gets (min of the message's and the subscription's).
 struct Deliver {
-    packets: Vec<u8>,
-    conns: Vec<u64>,
+    packet: Vec<u8>,
+    conns: Vec<(u64, u8)>,
 }
 
 struct Retain {
     topic: Box<str>,
     payload: Vec<u8>,
+    qos: u8,
 }
 
 struct RetainedQuery {
     filter: Box<str>,
     conn: u64,
+    qos: u8,
 }
 
 struct Register {
@@ -112,7 +116,7 @@ impl Actor for Router {
 
 impl Handler<SubAdd> for Router {
     fn on_event(&mut self, _ctx: &mut Context, _src: ActorId, e: &SubAdd) {
-        self.index.add(&e.filter, e.sub);
+        self.index.add(&e.filter, e.sub, e.qos);
     }
 }
 
@@ -125,7 +129,7 @@ impl Handler<SubRemove> for Router {
 // ---- Tier 3: retained messages and client-id registry ------------------------------------------
 
 pub struct Contexts {
-    retained: HashMap<Box<str>, Vec<u8>>,
+    retained: HashMap<Box<str>, (Vec<u8>, u8)>,
     clients: HashMap<Box<str>, Sub>,
 }
 
@@ -143,21 +147,19 @@ impl Handler<Retain> for Contexts {
         if e.payload.is_empty() {
             self.retained.remove(&e.topic);
         } else {
-            self.retained.insert(e.topic.clone(), e.payload.clone());
+            self.retained.insert(e.topic.clone(), (e.payload.clone(), e.qos));
         }
     }
 }
 
 impl Handler<RetainedQuery> for Contexts {
     fn on_event(&mut self, ctx: &mut Context, src: ActorId, q: &RetainedQuery) {
-        let mut packets = Vec::new();
-        for (topic, payload) in &self.retained {
+        for (topic, (payload, qos)) in &self.retained {
             if codec::matches(&q.filter, topic) {
-                codec::publish(&mut packets, topic, payload, 0, true, None);
+                let mut packet = Vec::new();
+                codec::publish(&mut packet, topic, payload, 0, true, None);
+                ctx.send(src, Deliver { packet, conns: vec![(q.conn, (*qos).min(q.qos))] });
             }
-        }
-        if !packets.is_empty() {
-            ctx.send(src, Deliver { packets, conns: vec![q.conn] });
         }
     }
 }
@@ -199,7 +201,39 @@ fn token(kind: u64, conn: u64) -> u64 {
 struct OwnedWill {
     topic: Box<str>,
     payload: Vec<u8>,
+    qos: u8,
     retain: bool,
+}
+
+/// QoS 1 messages to a connection: sent and waiting for PUBACK, or waiting for room in the
+/// in-flight window. Allocated with the first QoS 1 delivery.
+#[derive(Default)]
+struct Outbound {
+    last_id: u16,
+    /// Packet id and encoding, kept for redelivery.
+    inflight: VecDeque<(u16, Vec<u8>)>,
+    /// QoS 0 encodings, given an id when they enter the window.
+    pending: VecDeque<Vec<u8>>,
+    pending_bytes: usize,
+}
+
+impl Outbound {
+    fn next_id(&mut self) -> u16 {
+        loop {
+            self.last_id = self.last_id.wrapping_add(1).max(1);
+            if !self.inflight.iter().any(|(id, _)| *id == self.last_id) {
+                return self.last_id;
+            }
+        }
+    }
+
+    /// Moves `packet` into the window: encoded with a fresh id at the end of `out`.
+    fn send(&mut self, out: &mut Vec<u8>, packet: &[u8]) {
+        let id = self.next_id();
+        let start = out.len();
+        codec::requalify(out, packet, 1, id);
+        self.inflight.push_back((id, out[start..].to_vec()));
+    }
 }
 
 /// What `handle` asks of the connection after a packet.
@@ -220,6 +254,7 @@ struct Conn {
     last_rx: u32,
     will: Option<OwnedWill>,
     close_after_flush: bool,
+    outbound: Option<Box<Outbound>>,
     /// Bytes waiting to be sent. (The receive buffer is always owned by the recv in flight.)
     out: Vec<u8>,
     sending: bool,
@@ -236,7 +271,8 @@ pub struct Connections {
     connect_timeout: u32,
     max_packet: usize,
     max_queued: usize,
-    /// QoS 0 messages dropped because the subscriber's output queue was full.
+    max_inflight: usize,
+    /// Messages dropped because the subscriber's output queue was full.
     pub dropped: u64,
     router: Option<ActorRef<Router>>,
     conns: Vec<Option<Conn>>,
@@ -246,7 +282,7 @@ pub struct Connections {
     callback_armed: bool,
     // Scratch buffers reused across publishes.
     packet: Vec<u8>,
-    targets: Vec<Sub>,
+    targets: Vec<Entry>,
     /// Connections accepted and currently open on this core.
     pub open: usize,
 }
@@ -295,6 +331,7 @@ impl Connections {
             last_rx: self.tick,
             will: None,
             close_after_flush: false,
+            outbound: None,
             out: Vec::new(),
             sending: false,
             dirty: false,
@@ -327,10 +364,10 @@ impl Connections {
                 let partition = self.topology.partition(&will.topic);
                 ctx.send(
                     actor(partition, CONTEXT),
-                    Retain { topic: will.topic.clone(), payload: will.payload.clone() },
+                    Retain { topic: will.topic.clone(), payload: will.payload.clone(), qos: will.qos },
                 );
             }
-            self.publish(ctx, &will.topic, &will.payload);
+            self.publish(ctx, &will.topic, &will.payload, will.qos);
         }
         if let Some(client_id) = conn.client_id {
             let partition = self.topology.partition(&client_id);
@@ -429,8 +466,12 @@ impl Connections {
                 }
                 conn.connected = true;
                 conn.keep_alive = c.keep_alive;
-                conn.will =
-                    c.will.map(|w| OwnedWill { topic: w.topic.into(), payload: w.payload.to_vec(), retain: w.retain });
+                conn.will = c.will.map(|w| OwnedWill {
+                    topic: w.topic.into(),
+                    payload: w.payload.to_vec(),
+                    qos: w.qos.min(1),
+                    retain: w.retain,
+                });
                 let client_id = c.client_id;
                 if !client_id.is_empty() {
                     conn.client_id = Some(client_id.into());
@@ -442,9 +483,9 @@ impl Connections {
             Packet::Publish { topic, payload, qos, retain, packet_id, .. } => {
                 if retain {
                     let partition = self.topology.partition(topic);
-                    ctx.send(actor(partition, CONTEXT), Retain { topic: topic.into(), payload: payload.to_vec() });
+                    ctx.send(actor(partition, CONTEXT), Retain { topic: topic.into(), payload: payload.to_vec(), qos });
                 }
-                self.publish(ctx, topic, payload);
+                self.publish(ctx, topic, payload, qos);
                 if qos == 1 {
                     codec::puback(&mut self.get(id).unwrap().out, packet_id.unwrap_or(0));
                     self.mark_dirty(ctx, id);
@@ -454,18 +495,23 @@ impl Connections {
             }
             Packet::Subscribe { packet_id, filters } => {
                 let sub = (core, id);
-                for (filter, _) in &filters {
-                    self.router.as_ref().unwrap().borrow_mut().index.add(filter, sub);
+                // QoS 2 is granted as QoS 1 (allowed by the protocol).
+                let granted: Vec<u8> = filters.iter().map(|(_, q)| (*q).min(1)).collect();
+                for (&(filter, _), &qos) in filters.iter().zip(&granted) {
+                    self.router.as_ref().unwrap().borrow_mut().index.add(filter, sub, qos);
                     for &other in &self.topology.cores {
                         if other != ctx.core() {
-                            ctx.send(actor(other, ROUTER), SubAdd { filter: (*filter).into(), sub });
+                            ctx.send(actor(other, ROUTER), SubAdd { filter: filter.into(), sub, qos });
                         }
-                        ctx.send(actor(other, CONTEXT), RetainedQuery { filter: (*filter).into(), conn: id });
+                        ctx.send(actor(other, CONTEXT), RetainedQuery { filter: filter.into(), conn: id, qos });
                     }
                 }
                 let conn = self.get(id).unwrap();
-                conn.filters.extend(filters.iter().map(|(f, _)| Box::<str>::from(*f)));
-                let granted = vec![0u8; filters.len()]; // QoS 0 granted
+                for (f, _) in &filters {
+                    if !conn.filters.iter().any(|g| &**g == *f) {
+                        conn.filters.push((*f).into());
+                    }
+                }
                 codec::suback(&mut conn.out, packet_id, &granted);
                 self.mark_dirty(ctx, id);
             }
@@ -488,7 +534,7 @@ impl Connections {
                 codec::pingresp(&mut self.get(id).unwrap().out);
                 self.mark_dirty(ctx, id);
             }
-            Packet::PubAck { .. } => {}
+            Packet::PubAck { packet_id } => self.acked(ctx, id, packet_id),
             Packet::Disconnect => {
                 self.get(id).unwrap().will = None; // a clean disconnect discards the will
                 return Next::Close;
@@ -500,32 +546,39 @@ impl Connections {
 
     /// Routes a message: synchronous match on this core's router replica, local delivery, one
     /// `Deliver` event per other core with subscribers.
-    fn publish(&mut self, ctx: &mut Context, topic: &str, payload: &[u8]) {
+    fn publish(&mut self, ctx: &mut Context, topic: &str, payload: &[u8], qos: u8) {
         let mut targets = std::mem::take(&mut self.targets);
         targets.clear();
-        self.router.as_ref().unwrap().borrow().index.for_each_match(topic, |s| targets.push(s));
+        self.router.as_ref().unwrap().borrow().index.for_each_match(topic, |s, q| targets.push((s, q.min(qos))));
         if targets.is_empty() {
             self.targets = targets;
             return;
         }
-        targets.sort_unstable();
-        targets.dedup(); // one delivery per connection, whatever the number of matching filters
+        // One delivery per connection, whatever the number of matching filters, at the highest
+        // of their QoS.
+        targets.sort_unstable_by_key(|e| e.0);
+        targets.dedup_by(|a, b| {
+            let same = a.0 == b.0;
+            if same {
+                b.1 = b.1.max(a.1);
+            }
+            same
+        });
         let mut packet = std::mem::take(&mut self.packet);
         packet.clear();
         codec::publish(&mut packet, topic, payload, 0, false, None);
         let here = self.core(ctx);
-        let max_queued = self.max_queued;
         let mut i = 0;
         while i < targets.len() {
-            let core = targets[i].0;
-            let j = targets[i..].iter().position(|s| s.0 != core).map_or(targets.len(), |n| i + n);
+            let core = targets[i].0 .0;
+            let j = targets[i..].iter().position(|e| e.0 .0 != core).map_or(targets.len(), |n| i + n);
             if core == here {
-                for &(_, id) in &targets[i..j] {
-                    self.enqueue(ctx, id, &packet, max_queued);
+                for &((_, id), q) in &targets[i..j] {
+                    self.deliver(ctx, id, &packet, q);
                 }
             } else {
-                let conns = targets[i..j].iter().map(|s| s.1).collect();
-                ctx.send(actor(core as CoreId, CONNECTIONS), Deliver { packets: packet.clone(), conns });
+                let conns = targets[i..j].iter().map(|&((_, id), q)| (id, q)).collect();
+                ctx.send(actor(core as CoreId, CONNECTIONS), Deliver { packet: packet.clone(), conns });
             }
             i = j;
         }
@@ -533,17 +586,54 @@ impl Connections {
         self.targets = targets;
     }
 
-    /// Queues a QoS 0 PUBLISH for connection `id`, or drops it if the connection already has
-    /// `max_queued` bytes waiting (a subscriber slower than its publishers).
+    /// Queues the message encoded (QoS 0) in `packet` for connection `id` at QoS `qos`.
+    ///
+    /// QoS 0 messages are dropped if the connection already has `max_queued` bytes waiting (a
+    /// subscriber slower than its publishers). QoS 1 messages enter the in-flight window, or
+    /// wait for room in it, or are dropped once `max_queued` bytes wait.
     #[inline]
-    fn enqueue(&mut self, ctx: &mut Context, id: u64, packet: &[u8], max_queued: usize) {
+    fn deliver(&mut self, ctx: &mut Context, id: u64, packet: &[u8], qos: u8) {
+        let (max_queued, max_inflight) = (self.max_queued, self.max_inflight);
         let Some(c) = self.get(id) else { return };
-        if c.out.len() >= max_queued {
-            self.dropped += 1;
-            return;
+        if qos == 0 {
+            if c.out.len() >= max_queued {
+                self.dropped += 1;
+                return;
+            }
+            c.out.extend_from_slice(packet);
+        } else {
+            let ob = c.outbound.get_or_insert_with(Default::default);
+            if ob.inflight.len() < max_inflight {
+                ob.send(&mut c.out, packet);
+            } else if ob.pending_bytes + c.out.len() < max_queued {
+                ob.pending_bytes += packet.len();
+                ob.pending.push_back(packet.to_vec());
+                return;
+            } else {
+                self.dropped += 1;
+                return;
+            }
         }
-        c.out.extend_from_slice(packet);
         self.mark_dirty(ctx, id);
+    }
+
+    /// PUBACK from connection `id`: frees a slot of its window for the next pending message.
+    fn acked(&mut self, ctx: &mut Context, id: u64, packet_id: u16) {
+        let max_inflight = self.max_inflight;
+        let Some(c) = self.get(id) else { return };
+        let Some(ob) = c.outbound.as_mut() else { return };
+        let Some(at) = ob.inflight.iter().position(|(i, _)| *i == packet_id) else { return };
+        ob.inflight.remove(at);
+        let mut sent = false;
+        while ob.inflight.len() < max_inflight {
+            let Some(next) = ob.pending.pop_front() else { break };
+            ob.pending_bytes -= next.len();
+            ob.send(&mut c.out, &next);
+            sent = true;
+        }
+        if sent {
+            self.mark_dirty(ctx, id);
+        }
     }
 
     fn sent(&mut self, ctx: &mut Context, id: u64, result: i32, mut buf: Vec<u8>) {
@@ -646,9 +736,8 @@ impl Handler<IoCompletion> for Connections {
 
 impl Handler<Deliver> for Connections {
     fn on_event(&mut self, ctx: &mut Context, _src: ActorId, d: &Deliver) {
-        let max_queued = self.max_queued;
-        for &id in &d.conns {
-            self.enqueue(ctx, id, &d.packets, max_queued);
+        for &(id, qos) in &d.conns {
+            self.deliver(ctx, id, &d.packet, qos);
         }
     }
 }
@@ -670,8 +759,10 @@ pub struct Config {
     pub connect_timeout: Duration,
     /// Largest packet accepted from a client (remaining length); larger ones close the connection.
     pub max_packet: usize,
-    /// Output bytes a connection may have waiting before QoS 0 messages to it are dropped.
+    /// Output bytes a connection may have waiting before messages to it are dropped.
     pub max_queued: usize,
+    /// QoS 1 messages sent to a connection and not acknowledged yet, at most.
+    pub max_inflight: usize,
 }
 
 impl Default for Config {
@@ -684,6 +775,7 @@ impl Default for Config {
             connect_timeout: Duration::from_secs(10),
             max_packet: codec::MAX_PACKET,
             max_queued: 4 << 20,
+            max_inflight: 32,
         }
     }
 }
@@ -697,7 +789,7 @@ pub fn start(config: &Config) -> std::io::Result<Engine> {
         let listener = net::reuseport_listener(config.ip, config.port, 4096)?;
         let timer = net::timerfd(TICK)?;
         let connect_timeout = config.connect_timeout.as_secs().max(1) as u32;
-        let (max_packet, max_queued) = (config.max_packet, config.max_queued);
+        let (max_packet, max_queued, max_inflight) = (config.max_packet, config.max_queued, config.max_inflight);
         seq.core_mode(core, config.mode);
         seq.io_uring(core, 4096);
         // Added in this order on every core, so that their ids are known up front.
@@ -712,6 +804,7 @@ pub fn start(config: &Config) -> std::io::Result<Engine> {
             connect_timeout,
             max_packet,
             max_queued,
+            max_inflight,
             dropped: 0,
             router: None,
             conns: Vec::new(),

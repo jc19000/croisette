@@ -44,7 +44,7 @@ fn client(addr: SocketAddr, id: &str) -> Client {
 }
 
 fn publish_msg(topic: &str, payload: &[u8]) -> Incoming {
-    Incoming::Publish { topic: topic.into(), payload: payload.into(), retain: false }
+    Incoming::Publish { topic: topic.into(), payload: payload.into(), qos: 0, retain: false }
 }
 
 #[test]
@@ -97,7 +97,7 @@ fn retained_message_is_sent_on_subscribe_and_cleared() {
     s.subscribe(&["status/#"]).unwrap();
     assert_eq!(
         s.next_publish().unwrap(),
-        Incoming::Publish { topic: "status/door".into(), payload: b"open".to_vec(), retain: true }
+        Incoming::Publish { topic: "status/door".into(), payload: b"open".to_vec(), qos: 0, retain: true }
     );
     p.publish("status/door", b"", 1, true).unwrap(); // empty retained payload clears it
     std::thread::sleep(Duration::from_millis(50));
@@ -219,7 +219,7 @@ fn will_is_published_on_abrupt_close_only() {
     late.subscribe(&["status/dev3"]).unwrap();
     assert_eq!(
         late.next_publish().unwrap(),
-        Incoming::Publish { topic: "status/dev3".into(), payload: b"gone".to_vec(), retain: true }
+        Incoming::Publish { topic: "status/dev3".into(), payload: b"gone".to_vec(), qos: 0, retain: true }
     );
     engine.shutdown();
 }
@@ -343,4 +343,142 @@ fn large_packets_are_received_whole() {
     p.publish("big", &payload, 1, false).unwrap();
     assert_eq!(s.next_publish().unwrap(), publish_msg("big", &payload));
     engine.shutdown();
+}
+
+// ---- QoS 1 --------------------------------------------------------------------------------------
+
+fn qos1_msg(topic: &str, payload: &[u8], retain: bool) -> Incoming {
+    Incoming::Publish { topic: topic.into(), payload: payload.into(), qos: 1, retain }
+}
+
+#[test]
+fn delivery_qos_is_the_lower_of_publish_and_subscription() {
+    let _g = serial();
+    let (engine, addr) = start(vec![1, 2]);
+    let mut s1 = client(addr, "s1");
+    assert_eq!(s1.subscribe_qos(&["q/1"], 1).unwrap(), vec![1]);
+    assert_eq!(s1.subscribe_qos(&["q/2"], 2).unwrap(), vec![1], "QoS 2 is granted as QoS 1");
+    let mut s0 = client(addr, "s0");
+    s0.subscribe(&["q/1"]).unwrap();
+    let mut p = client(addr, "p");
+    p.publish("q/1", b"a", 1, false).unwrap();
+    p.publish("q/1", b"b", 0, false).unwrap();
+    p.publish("q/2", b"c", 1, false).unwrap();
+    assert_eq!(s1.next_publish().unwrap(), qos1_msg("q/1", b"a", false));
+    assert_eq!(s1.next_publish().unwrap(), publish_msg("q/1", b"b"));
+    assert_eq!(s1.next_publish().unwrap(), qos1_msg("q/2", b"c", false));
+    assert_eq!(s0.next_publish().unwrap(), publish_msg("q/1", b"a"));
+    assert_eq!(s0.next_publish().unwrap(), publish_msg("q/1", b"b"));
+    // Overlapping filters: one delivery, at the highest QoS.
+    let mut both = client(addr, "both");
+    both.subscribe(&["o/#"]).unwrap();
+    both.subscribe_qos(&["o/+"], 1).unwrap();
+    p.publish("o/x", b"d", 1, false).unwrap();
+    assert_eq!(both.next_publish().unwrap(), qos1_msg("o/x", b"d", false));
+    both.set_timeout(Some(Duration::from_millis(200))).unwrap();
+    assert!(both.next_publish().is_err());
+    engine.shutdown();
+}
+
+#[test]
+fn inflight_window_waits_for_acks() {
+    let _g = serial();
+    let (engine, addr) = start_with(Config { cores: vec![1, 2], max_inflight: 4, ..Config::default() });
+    let mut s = client(addr, "s");
+    s.auto_ack = false;
+    s.subscribe_qos(&["w"], 1).unwrap();
+    let mut p = client(addr, "p");
+    for i in 0..10u8 {
+        p.publish("w", &[i], 1, false).unwrap();
+    }
+    let mut ids = Vec::new();
+    for i in 0..4u8 {
+        assert_eq!(s.next_publish().unwrap(), qos1_msg("w", &[i], false));
+        ids.push(s.last_packet_id.unwrap());
+    }
+    s.set_timeout(Some(Duration::from_millis(200))).unwrap();
+    assert!(s.next_publish().is_err(), "window full");
+    // Acknowledging two messages lets two more through, in order.
+    s.puback(ids[1]).unwrap();
+    s.puback(ids[0]).unwrap();
+    s.set_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(s.next_publish().unwrap(), qos1_msg("w", &[4], false));
+    assert_eq!(s.next_publish().unwrap(), qos1_msg("w", &[5], false));
+    s.set_timeout(Some(Duration::from_millis(200))).unwrap();
+    assert!(s.next_publish().is_err(), "window full again");
+    s.auto_ack = true;
+    for &id in &ids[2..] {
+        s.puback(id).unwrap();
+    }
+    s.puback(s.last_packet_id.unwrap()).unwrap();
+    s.set_timeout(Some(Duration::from_secs(5))).unwrap();
+    for i in 6..10u8 {
+        assert_eq!(s.next_publish().unwrap(), qos1_msg("w", &[i], false));
+    }
+    engine.shutdown();
+}
+
+#[test]
+fn retained_message_keeps_its_qos() {
+    let _g = serial();
+    let (engine, addr) = start(vec![1, 2]);
+    let mut p = client(addr, "p");
+    p.publish("cfg/a", b"1", 1, true).unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    let mut s1 = client(addr, "s1");
+    s1.subscribe_qos(&["cfg/#"], 1).unwrap();
+    assert_eq!(s1.next_publish().unwrap(), qos1_msg("cfg/a", b"1", true));
+    let mut s0 = client(addr, "s0");
+    s0.subscribe(&["cfg/#"]).unwrap();
+    assert_eq!(
+        s0.next_publish().unwrap(),
+        Incoming::Publish { topic: "cfg/a".into(), payload: b"1".to_vec(), qos: 0, retain: true }
+    );
+    engine.shutdown();
+}
+
+#[test]
+fn many_qos1_messages_keep_their_order() {
+    let _g = serial();
+    let (engine, addr) = start(vec![1, 2]);
+    let mut subs: Vec<Client> = (0..4).map(|i| client(addr, &format!("s{i}"))).collect();
+    for s in subs.iter_mut() {
+        s.subscribe_qos(&["seq"], 1).unwrap();
+    }
+    let mut p = client(addr, "p");
+    let readers: Vec<_> = subs
+        .into_iter()
+        .map(|mut s| {
+            std::thread::spawn(move || {
+                let mut next = 0u32;
+                while next < 20_000 {
+                    s.read_publishes(|payload| {
+                        assert_eq!(u32::from_be_bytes(payload.try_into().unwrap()), next);
+                        next += 1;
+                    })
+                    .unwrap();
+                }
+            })
+        })
+        .collect();
+    let drain = {
+        let mut acks = p.stream.try_clone().unwrap();
+        std::thread::spawn(move || {
+            let mut b = [0u8; 4096];
+            while acks.read(&mut b).map_or(false, |n| n > 0) {}
+        })
+    };
+    for i in 0..20_000u32 {
+        p.queue_publish("seq", &i.to_be_bytes(), 1, false);
+        if i % 100 == 99 {
+            p.flush().unwrap();
+        }
+    }
+    p.flush().unwrap();
+    for r in readers {
+        r.join().unwrap();
+    }
+    engine.shutdown();
+    drop(p);
+    drain.join().unwrap();
 }

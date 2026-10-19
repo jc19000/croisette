@@ -363,6 +363,23 @@ pub fn publish(out: &mut Vec<u8>, topic: &str, payload: &[u8], qos: u8, retain: 
     out.extend_from_slice(payload);
 }
 
+/// Re-encodes a QoS 0 PUBLISH built by `publish` as QoS `qos` with `packet_id`, keeping its
+/// retain flag: the broker encodes a message once and gives each QoS 1 subscriber its own id.
+pub fn requalify(out: &mut Vec<u8>, packet: &[u8], qos: u8, packet_id: u16) {
+    let (rem, var_len) = remaining_length(&packet[1..]).ok().flatten().expect("a packet built by `publish`");
+    let body = &packet[1 + var_len..1 + var_len + rem];
+    let topic_end = 2 + u16::from_be_bytes([body[0], body[1]]) as usize;
+    put_header(out, 0x30 | (qos << 1) | (packet[0] & 0x01), rem + 2);
+    out.extend_from_slice(&body[..topic_end]);
+    out.extend_from_slice(&packet_id.to_be_bytes());
+    out.extend_from_slice(&body[topic_end..]);
+}
+
+/// Sets the DUP flag of an encoded PUBLISH (redelivery).
+pub fn set_dup(packet: &mut [u8]) {
+    packet[0] |= 0x08;
+}
+
 pub fn puback(out: &mut Vec<u8>, packet_id: u16) {
     out.push(0x40);
     out.push(2);
@@ -420,6 +437,19 @@ mod tests {
         let (p, len) = parse(bytes).unwrap().unwrap();
         assert_eq!(len, bytes.len());
         p
+    }
+
+    #[test]
+    fn requalify_keeps_topic_payload_and_retain() {
+        let mut q0 = Vec::new();
+        publish(&mut q0, "a/b", b"hello", 0, true, None);
+        let mut q1 = Vec::new();
+        requalify(&mut q1, &q0, 1, 42);
+        let mut want = Vec::new();
+        publish(&mut want, "a/b", b"hello", 1, true, Some(42));
+        assert_eq!(q1, want);
+        set_dup(&mut q1);
+        assert!(matches!(roundtrip(&q1), Packet::Publish { dup: true, qos: 1, packet_id: Some(42), .. }));
     }
 
     #[test]

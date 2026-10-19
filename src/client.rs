@@ -11,13 +11,18 @@ pub struct Client {
     buf: Vec<u8>,
     start: usize,
     out: Vec<u8>,
+    acks: Vec<u8>,
     next_id: u16,
+    /// PUBACK every QoS 1 message as it is read (default).
+    pub auto_ack: bool,
+    /// Packet id of the last message returned by `next_publish` (QoS 1).
+    pub last_packet_id: Option<u16>,
 }
 
 /// A packet read from the broker, owned.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Incoming {
-    Publish { topic: String, payload: Vec<u8>, retain: bool },
+    Publish { topic: String, payload: Vec<u8>, qos: u8, retain: bool },
     Other(String),
 }
 
@@ -34,7 +39,16 @@ impl Client {
     pub fn connect_with(addr: SocketAddr, connect: &Connect<'_>) -> io::Result<(Client, bool)> {
         let stream = TcpStream::connect(addr)?;
         stream.set_nodelay(true)?;
-        let mut c = Client { stream, buf: Vec::with_capacity(64 * 1024), start: 0, out: Vec::new(), next_id: 1 };
+        let mut c = Client {
+            stream,
+            buf: Vec::with_capacity(64 * 1024),
+            start: 0,
+            out: Vec::new(),
+            acks: Vec::new(),
+            next_id: 1,
+            auto_ack: true,
+            last_packet_id: None,
+        };
         codec::connect_with(&mut c.out, connect);
         c.flush()?;
         let mut ack = None;
@@ -96,14 +110,26 @@ impl Client {
         Ok(())
     }
 
-    /// Subscribes and waits for the SUBACK.
+    /// Subscribes at QoS 0 and waits for the SUBACK.
     pub fn subscribe(&mut self, filters: &[&str]) -> io::Result<()> {
+        self.subscribe_qos(filters, 0).map(|_| ())
+    }
+
+    /// Subscribes at QoS `qos`, waits for the SUBACK and returns the granted QoS.
+    pub fn subscribe_qos(&mut self, filters: &[&str], qos: u8) -> io::Result<Vec<u8>> {
         let id = self.id();
-        let f: Vec<(&str, u8)> = filters.iter().map(|f| (*f, 0)).collect();
+        let f: Vec<(&str, u8)> = filters.iter().map(|f| (*f, qos)).collect();
         codec::subscribe(&mut self.out, id, &f);
         self.flush()?;
-        self.read_packet(|p| matches!(p, Packet::SubAck { .. }))?;
-        Ok(())
+        let mut granted = Vec::new();
+        self.read_packet(|p| match p {
+            Packet::SubAck { codes, .. } => {
+                granted = codes.clone();
+                true
+            }
+            _ => false,
+        })?;
+        Ok(granted)
     }
 
     pub fn unsubscribe(&mut self, filters: &[&str]) -> io::Result<()> {
@@ -130,12 +156,24 @@ impl Client {
     /// Next PUBLISH from the broker, blocking.
     pub fn next_publish(&mut self) -> io::Result<Incoming> {
         loop {
-            if let Some(i) = self.try_parse(|p| match p {
-                Packet::Publish { topic, payload, retain, .. } => {
-                    Some(Incoming::Publish { topic: topic.to_string(), payload: payload.to_vec(), retain })
+            let mut ack = None;
+            let got = self.try_parse(|p| match p {
+                Packet::Publish { topic, payload, qos, retain, packet_id, .. } => {
+                    if qos == 1 {
+                        ack = packet_id;
+                    }
+                    Some(Incoming::Publish { topic: topic.to_string(), payload: payload.to_vec(), qos, retain })
                 }
                 other => Some(Incoming::Other(format!("{other:?}"))),
-            })? {
+            })?;
+            if got.is_some() {
+                self.last_packet_id = ack;
+            }
+            if let (Some(id), true) = (ack, self.auto_ack) {
+                codec::puback(&mut self.acks, id);
+                self.send_acks()?;
+            }
+            if let Some(i) = got {
                 return Ok(i);
             }
         }
@@ -147,13 +185,38 @@ impl Client {
         self.fill()?;
         let mut n = 0;
         while let Some((packet, len)) = codec::parse(&self.buf[self.start..]).map_err(io::Error::other)? {
-            if let Packet::Publish { payload, .. } = packet {
+            if let Packet::Publish { payload, qos, packet_id, .. } = packet {
                 on_publish(payload);
                 n += 1;
+                if qos == 1 && self.auto_ack {
+                    codec::puback(&mut self.acks, packet_id.unwrap_or(0));
+                }
             }
             self.start += len;
         }
+        self.send_acks()?;
         Ok(n)
+    }
+
+    /// Acknowledges a QoS 1 message (when `auto_ack` is off).
+    pub fn puback(&mut self, packet_id: u16) -> io::Result<()> {
+        codec::puback(&mut self.acks, packet_id);
+        self.send_acks()
+    }
+
+    /// Writes pending PUBACKs; on a non-blocking stream, what does not fit waits for the next
+    /// call.
+    fn send_acks(&mut self) -> io::Result<()> {
+        let mut done = 0;
+        while done < self.acks.len() {
+            match self.stream.write(&self.acks[done..]) {
+                Ok(n) => done += n,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => return Err(e),
+            }
+        }
+        self.acks.drain(..done);
+        Ok(())
     }
 
     fn try_parse<T>(&mut self, mut f: impl FnMut(Packet<'_>) -> Option<T>) -> io::Result<Option<T>> {

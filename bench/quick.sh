@@ -25,3 +25,4 @@ run "$S1" flow --pubs 10 --subs 1 --rate 1000000 --secs 3 --warmup 1
 run "$S1" flow --pubs 1 --subs 50 --filter bench/0 --rate 10000 --secs 3 --warmup 1
 run "--cores 1,2 --mode adaptive" flow --pubs 10 --subs 1 --rate 500000 --secs 3 --warmup 1
 run "$S1" idle --conns 5000 --secs 3
+run "$S1" flow --pubs 10 --subs 1 --rate 200000 --secs 3 --warmup 1 --qos 1

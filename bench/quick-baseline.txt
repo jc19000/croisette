@@ -3,3 +3,4 @@
 [--cores 1 --mode sleep:1000] pubs=1 subs=50 filter=bench/0 rate=10000 | sent/s=9982 delivered/s=500465 | broker cpu=0.92 cores, 1.84 cpu-s per million delivered, rss=2 MB | latency us p50=604 p99=6287 p99.9=16502 max=20795
 [--cores 1,2 --mode adaptive] pubs=10 subs=1 filter=bench/# rate=500000 | sent/s=500412 delivered/s=500414 | broker cpu=1.91 cores, 3.82 cpu-s per million delivered, rss=3 MB | latency us p50=115 p99=3167 p99.9=7276 max=9634
 [--cores 1 --mode sleep:1000] idle conns=5000 | connect 1418 conn/s | broker rss 2 MB -> 8 MB, 1.29 KB per connection | broker cpu while idle 0.031 cores
+[--cores 1 --mode sleep:1000] pubs=10 subs=1 filter=bench/# rate=200000 qos=1 | sent/s=200483 delivered/s=194299 | broker cpu=0.97 cores, 5.00 cpu-s per million delivered, rss=9 MB | latency us p50=100000 p99=100000 p99.9=100000 max=100000
