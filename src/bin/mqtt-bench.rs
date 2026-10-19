@@ -135,7 +135,7 @@ fn flow(args: &Args, addr: SocketAddr, pid: u32) {
     let threads: usize = args.get("threads", 1);
 
     // Subscribers first, each subscribed before anyone publishes.
-    let mut sub_clients: Vec<Client> = (0..subs)
+    let sub_clients: Vec<Client> = (0..subs)
         .map(|i| {
             let mut c = connect_retry(addr, &format!("bench-sub-{i}"));
             c.subscribe(&[&filter]).unwrap();
@@ -152,9 +152,13 @@ fn flow(args: &Args, addr: SocketAddr, pid: u32) {
     let start = Arc::new(Barrier::new(readers_n + writers_n + 1));
 
     // Subscriber threads: spin over their non-blocking sockets.
-    let readers: Vec<_> = (0..readers_n)
-        .map(|t| {
-            let mine: Vec<Client> = (0..sub_clients.len()).rev().filter(|i| i % readers_n == t).map(|i| sub_clients.swap_remove(i)).collect();
+    let mut groups: Vec<Vec<Client>> = (0..readers_n).map(|_| Vec::new()).collect();
+    for (i, c) in sub_clients.into_iter().enumerate() {
+        groups[i % readers_n].push(c);
+    }
+    let readers: Vec<_> = groups
+        .into_iter()
+        .map(|mine| {
             let (stop, measuring, start) = (stop.clone(), measuring.clone(), start.clone());
             thread::spawn(move || {
                 let mut mine = mine;

@@ -7,7 +7,8 @@ cd "$(dirname "$0")/.."
 cargo build --release -q
 OUT=${1:-bench/results.txt}
 BENCH=./target/release/mqtt-bench
-: > "$OUT"
+ONLY=${ONLY:-fanin,fanout,idle}
+[ -n "${APPEND:-}" ] || : > "$OUT"
 
 declare -A BROKERS=(
   [mosquitto]="taskset -c 1 mosquitto -c bench/mosquitto.conf"
@@ -30,13 +31,13 @@ run() { # broker-name, bench args...
 
 for b in $ORDER; do
   # Fan-in: 10 publishers, 1 subscriber on bench/#. Total published rate in msg/s.
-  for r in 20000 100000 200000 500000 1000000 2000000; do
+  [[ $ONLY == *fanin* ]] && for r in 20000 100000 200000 500000 1000000 2000000; do
     run "$b" flow --pubs 10 --subs 1 --rate $r --secs 4 --warmup 1
   done
   # Fan-out: 1 publisher on bench/0, 50 subscribers: deliveries = 50 x rate.
-  for r in 1000 2000 4000 10000 20000 40000; do
-    run "$b" flow --pubs 1 --subs 50 --filter bench/0 --rate $r --secs 4 --warmup 1 --threads 2
+  [[ $ONLY == *fanout* ]] && for r in 1000 2000 4000 10000 20000 40000; do
+    run "$b" flow --pubs 1 --subs 50 --filter bench/0 --rate $r --secs 4 --warmup 1 --threads 1
   done
   # Idle connections: memory per connection, CPU while nothing happens.
-  run "$b" idle --conns 10000 --secs 5
+  [[ $ONLY == *idle* ]] && run "$b" idle --conns 10000 --secs 5
 done
