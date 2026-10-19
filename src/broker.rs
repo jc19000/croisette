@@ -234,6 +234,10 @@ pub struct Connections {
     timer: RawFd,
     tick: u32,
     connect_timeout: u32,
+    max_packet: usize,
+    max_queued: usize,
+    /// QoS 0 messages dropped because the subscriber's output queue was full.
+    pub dropped: u64,
     router: Option<ActorRef<Router>>,
     conns: Vec<Option<Conn>>,
     generations: Vec<u32>,
@@ -343,7 +347,7 @@ impl Connections {
         }
         let mut consumed = 0;
         loop {
-            match codec::parse(&buf[consumed..]) {
+            match codec::parse_limited(&buf[consumed..], self.max_packet) {
                 Ok(Some((packet, len))) => {
                     consumed += len;
                     match self.handle(ctx, id, packet) {
@@ -368,8 +372,10 @@ impl Connections {
             }
         }
         buf.drain(..consumed);
-        if buf.capacity() - buf.len() < RECV_BUF / 2 {
-            buf.reserve(RECV_BUF);
+        // Room for the rest of a large packet in one go, else for the next small ones.
+        let want = codec::packet_len(&buf).map_or(RECV_BUF, |n| n.saturating_sub(buf.len()).max(RECV_BUF / 2));
+        if buf.capacity() - buf.len() < want {
+            buf.reserve(want.max(RECV_BUF));
         }
         let tick = self.tick;
         let Some(conn) = self.get(id) else { return };
@@ -508,16 +514,14 @@ impl Connections {
         packet.clear();
         codec::publish(&mut packet, topic, payload, 0, false, None);
         let here = self.core(ctx);
+        let max_queued = self.max_queued;
         let mut i = 0;
         while i < targets.len() {
             let core = targets[i].0;
             let j = targets[i..].iter().position(|s| s.0 != core).map_or(targets.len(), |n| i + n);
             if core == here {
                 for &(_, id) in &targets[i..j] {
-                    if let Some(c) = self.get(id) {
-                        c.out.extend_from_slice(&packet);
-                        self.mark_dirty(ctx, id);
-                    }
+                    self.enqueue(ctx, id, &packet, max_queued);
                 }
             } else {
                 let conns = targets[i..j].iter().map(|s| s.1).collect();
@@ -527,6 +531,19 @@ impl Connections {
         }
         self.packet = packet;
         self.targets = targets;
+    }
+
+    /// Queues a QoS 0 PUBLISH for connection `id`, or drops it if the connection already has
+    /// `max_queued` bytes waiting (a subscriber slower than its publishers).
+    #[inline]
+    fn enqueue(&mut self, ctx: &mut Context, id: u64, packet: &[u8], max_queued: usize) {
+        let Some(c) = self.get(id) else { return };
+        if c.out.len() >= max_queued {
+            self.dropped += 1;
+            return;
+        }
+        c.out.extend_from_slice(packet);
+        self.mark_dirty(ctx, id);
     }
 
     fn sent(&mut self, ctx: &mut Context, id: u64, result: i32, mut buf: Vec<u8>) {
@@ -629,11 +646,9 @@ impl Handler<IoCompletion> for Connections {
 
 impl Handler<Deliver> for Connections {
     fn on_event(&mut self, ctx: &mut Context, _src: ActorId, d: &Deliver) {
+        let max_queued = self.max_queued;
         for &id in &d.conns {
-            if let Some(c) = self.get(id) {
-                c.out.extend_from_slice(&d.packets);
-                self.mark_dirty(ctx, id);
-            }
+            self.enqueue(ctx, id, &d.packets, max_queued);
         }
     }
 }
@@ -653,6 +668,10 @@ pub struct Config {
     pub mode: CoreMode,
     /// A connection that has not sent CONNECT after this long is closed.
     pub connect_timeout: Duration,
+    /// Largest packet accepted from a client (remaining length); larger ones close the connection.
+    pub max_packet: usize,
+    /// Output bytes a connection may have waiting before QoS 0 messages to it are dropped.
+    pub max_queued: usize,
 }
 
 impl Default for Config {
@@ -663,6 +682,8 @@ impl Default for Config {
             cores: vec![0],
             mode: CoreMode::Spin,
             connect_timeout: Duration::from_secs(10),
+            max_packet: codec::MAX_PACKET,
+            max_queued: 4 << 20,
         }
     }
 }
@@ -676,6 +697,7 @@ pub fn start(config: &Config) -> std::io::Result<Engine> {
         let listener = net::reuseport_listener(config.ip, config.port, 4096)?;
         let timer = net::timerfd(TICK)?;
         let connect_timeout = config.connect_timeout.as_secs().max(1) as u32;
+        let (max_packet, max_queued) = (config.max_packet, config.max_queued);
         seq.core_mode(core, config.mode);
         seq.io_uring(core, 4096);
         // Added in this order on every core, so that their ids are known up front.
@@ -688,6 +710,9 @@ pub fn start(config: &Config) -> std::io::Result<Engine> {
             timer,
             tick: 0,
             connect_timeout,
+            max_packet,
+            max_queued,
+            dropped: 0,
             router: None,
             conns: Vec::new(),
             generations: Vec::new(),

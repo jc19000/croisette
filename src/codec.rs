@@ -59,11 +59,23 @@ pub struct Will<'a> {
     pub retain: bool,
 }
 
+/// Default limit on the size of a packet (its remaining length), 1 MiB.
 pub const MAX_PACKET: usize = 1 << 20;
 
-/// Parses one packet at the start of `buf`. `Ok(None)`: incomplete, wait for more bytes.
-/// `Ok(Some((packet, len)))`: `len` bytes consumed.
+/// Parses one packet at the start of `buf`, of at most `MAX_PACKET` bytes. `Ok(None)`:
+/// incomplete, wait for more bytes. `Ok(Some((packet, len)))`: `len` bytes consumed.
 pub fn parse(buf: &[u8]) -> Result<Option<(Packet<'_>, usize)>, Error> {
+    parse_limited(buf, MAX_PACKET)
+}
+
+/// Total size of the packet starting `buf`, once its fixed header is complete.
+pub fn packet_len(buf: &[u8]) -> Option<usize> {
+    let (rem, var_len) = remaining_length(buf.get(1..)?).ok()??;
+    Some(1 + var_len + rem)
+}
+
+/// `parse` with a limit of `max` bytes on the remaining length.
+pub fn parse_limited(buf: &[u8], max: usize) -> Result<Option<(Packet<'_>, usize)>, Error> {
     if buf.len() < 2 {
         return Ok(None);
     }
@@ -71,7 +83,7 @@ pub fn parse(buf: &[u8]) -> Result<Option<(Packet<'_>, usize)>, Error> {
         Some(v) => v,
         None => return Ok(None),
     };
-    if rem > MAX_PACKET {
+    if rem > max {
         return Err(Error::TooLarge);
     }
     let total = 1 + var_len + rem;

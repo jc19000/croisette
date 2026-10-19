@@ -21,9 +21,18 @@ fn free_port() -> u16 {
 }
 
 fn start(cores: Vec<usize>) -> (cannes::Engine, SocketAddr) {
+    start_with(Config { cores, ..Config::default() })
+}
+
+fn start_with(config: Config) -> (cannes::Engine, SocketAddr) {
     let port = free_port();
-    let config =
-        Config { ip: Ipv4Addr::LOCALHOST, port, cores, mode: CoreMode::Spin, connect_timeout: Duration::from_secs(1) };
+    let config = Config {
+        ip: Ipv4Addr::LOCALHOST,
+        port,
+        mode: CoreMode::Spin,
+        connect_timeout: Duration::from_secs(1),
+        ..config
+    };
     let engine = broker::start(&config).unwrap();
     (engine, SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
 }
@@ -263,5 +272,75 @@ fn connect_is_validated() {
     // And no CONNECT at all, after the connect timeout (1 s in the tests).
     let mut idle = TcpStream::connect(addr).unwrap();
     assert_closed_by_broker(&mut idle, Duration::from_secs(4));
+    engine.shutdown();
+}
+
+// ---- Limits ---------------------------------------------------------------------------------
+
+#[test]
+fn slow_subscriber_loses_qos0_messages_without_slowing_the_others() {
+    let _g = serial();
+    let (engine, addr) = start_with(Config { cores: vec![1, 2], max_queued: 1 << 20, ..Config::default() });
+    let mut slow = client(addr, "slow");
+    slow.subscribe(&["flood"]).unwrap();
+    let mut fast = client(addr, "fast");
+    fast.subscribe(&["flood"]).unwrap();
+    let mut p = client(addr, "p");
+    let payload = [7u8; 1000];
+    let n = 20_000; // 20 MB, far more than the socket buffers and the 1 MiB queue
+    let reader = std::thread::spawn(move || {
+        let mut got = 0;
+        while got < n {
+            got += fast.read_publishes(|_| {}).unwrap();
+        }
+        fast
+    });
+    for i in 0..n {
+        p.queue_publish("flood", &payload, 0, false);
+        if i % 100 == 99 {
+            p.flush().unwrap();
+        }
+    }
+    p.flush().unwrap();
+    let _fast = reader.join().unwrap(); // the fast subscriber got every message
+                                        // The slow one now reads what was kept for it: a bounded part of the flood.
+    slow.set_timeout(Some(Duration::from_millis(500))).unwrap();
+    let mut kept = 0;
+    while slow.next_publish().is_ok() {
+        kept += 1;
+    }
+    // Its connection survived: it gets the next message.
+    p.publish("flood", b"end", 1, false).unwrap();
+    slow.set_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(slow.next_publish().unwrap(), publish_msg("flood", b"end"));
+    assert!(kept < n / 2, "kept {kept} of {n}");
+    engine.shutdown();
+}
+
+#[test]
+fn oversized_packet_closes_the_connection() {
+    let _g = serial();
+    let (engine, addr) = start_with(Config { cores: vec![1, 2], max_packet: 1000, ..Config::default() });
+    let mut s = client(addr, "s");
+    s.subscribe(&["big"]).unwrap();
+    let mut p = client(addr, "p");
+    p.publish("big", &[1u8; 900], 0, false).unwrap();
+    assert_eq!(s.next_publish().unwrap(), publish_msg("big", &[1u8; 900]));
+    p.queue_publish("big", &[1u8; 1100], 0, false);
+    p.flush().unwrap();
+    assert_closed_by_broker(&mut p.stream, Duration::from_secs(2));
+    engine.shutdown();
+}
+
+#[test]
+fn large_packets_are_received_whole() {
+    let _g = serial();
+    let (engine, addr) = start(vec![1, 2]);
+    let mut s = client(addr, "s");
+    s.subscribe(&["big"]).unwrap();
+    let mut p = client(addr, "p");
+    let payload: Vec<u8> = (0..900_000u32).map(|i| i as u8).collect();
+    p.publish("big", &payload, 1, false).unwrap();
+    assert_eq!(s.next_publish().unwrap(), publish_msg("big", &payload));
     engine.shutdown();
 }

@@ -1,6 +1,7 @@
 //! MQTT broker on cannes.
 //!
-//! usage: croisette [--port 1883] [--cores 1,2] [--mode MODE]
+//! usage: croisette [--port 1883] [--cores 1,2] [--mode MODE] [--max-queued BYTES]
+//!        [--max-packet BYTES] [--connect-timeout SECONDS]
 //!
 //! MODE: `spin`, `adaptive` (2000 idle loops, then 50 µs sleeps), `adaptive:<loops>:<µs>`,
 //! `sleep:<µs>` (wait in io_uring after each idle iteration, an I/O completion ends the wait).
@@ -31,6 +32,9 @@ fn main() {
                     _ => panic!("unknown mode {value}"),
                 }
             }
+            "--max-queued" => config.max_queued = value.parse().expect("bytes"),
+            "--max-packet" => config.max_packet = value.parse().expect("bytes"),
+            "--connect-timeout" => config.connect_timeout = Duration::from_secs(value.parse().expect("seconds")),
             other => panic!("unknown option {other}"),
         }
     }
