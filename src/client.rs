@@ -19,6 +19,8 @@ pub struct Client {
     pub last_packet_id: Option<u16>,
     /// DUP flag of the last message returned by `next_publish` (a redelivery).
     pub last_dup: bool,
+    /// Ids of QoS 2 messages received and not released by the broker yet.
+    qos2: Vec<u16>,
 }
 
 /// A packet read from the broker, owned.
@@ -51,6 +53,7 @@ impl Client {
             auto_ack: true,
             last_packet_id: None,
             last_dup: false,
+            qos2: Vec::new(),
         };
         codec::connect_with(&mut c.out, connect);
         c.flush()?;
@@ -93,16 +96,27 @@ impl Client {
     }
 
     /// Queues a PUBLISH; call `flush` to send queued packets.
-    pub fn queue_publish(&mut self, topic: &str, payload: &[u8], qos: u8, retain: bool) {
+    /// Returns the packet id (QoS 1 and 2).
+    pub fn queue_publish(&mut self, topic: &str, payload: &[u8], qos: u8, retain: bool) -> Option<u16> {
         let id = if qos > 0 { Some(self.id()) } else { None };
         codec::publish(&mut self.out, topic, payload, qos, retain, id);
+        id
     }
 
     pub fn publish(&mut self, topic: &str, payload: &[u8], qos: u8, retain: bool) -> io::Result<()> {
-        self.queue_publish(topic, payload, qos, retain);
+        let id = self.queue_publish(topic, payload, qos, retain);
         self.flush()?;
-        if qos == 1 {
-            self.read_packet(|p| matches!(p, Packet::PubAck { .. }))?;
+        match (qos, id) {
+            (1, _) => {
+                self.read_packet(|p| matches!(p, Packet::PubAck { .. }))?;
+            }
+            (2, Some(id)) => {
+                self.read_packet(|p| matches!(p, Packet::PubRec { packet_id } if *packet_id == id))?;
+                codec::pubrel(&mut self.out, id);
+                self.flush()?;
+                self.read_packet(|p| matches!(p, Packet::PubComp { packet_id } if *packet_id == id))?;
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -163,31 +177,69 @@ impl Client {
 
     /// Next PUBLISH from the broker, blocking.
     pub fn next_publish(&mut self) -> io::Result<Incoming> {
+        enum Got {
+            Msg(Incoming, u8, Option<u16>, bool),
+            Rel(u16),
+            Other(String),
+        }
         loop {
-            let mut ack = None;
-            let mut last_dup = false;
-            let got = self.try_parse(|p| match p {
-                Packet::Publish { topic, payload, qos, retain, packet_id, dup } => {
-                    if qos == 1 {
-                        ack = packet_id;
+            let got = self.try_parse(|p| {
+                Some(match p {
+                    Packet::Publish { topic, payload, qos, retain, packet_id, dup } => {
+                        let m = Incoming::Publish { topic: topic.to_string(), payload: payload.to_vec(), qos, retain };
+                        Got::Msg(m, qos, packet_id, dup)
                     }
-                    last_dup = dup;
-                    Some(Incoming::Publish { topic: topic.to_string(), payload: payload.to_vec(), qos, retain })
-                }
-                other => Some(Incoming::Other(format!("{other:?}"))),
+                    Packet::PubRel { packet_id } => Got::Rel(packet_id),
+                    other => Got::Other(format!("{other:?}")),
+                })
             })?;
-            if got.is_some() {
-                self.last_packet_id = ack;
-                self.last_dup = last_dup;
-            }
-            if let (Some(id), true) = (ack, self.auto_ack) {
-                codec::puback(&mut self.acks, id);
-                self.send_acks()?;
-            }
-            if let Some(i) = got {
-                return Ok(i);
+            match got {
+                None => {}
+                Some(Got::Rel(id)) => self.released(id)?,
+                Some(Got::Other(s)) => return Ok(Incoming::Other(s)),
+                Some(Got::Msg(m, qos, packet_id, dup)) => {
+                    self.last_packet_id = packet_id;
+                    self.last_dup = dup;
+                    if self.on_publish(qos, packet_id.unwrap_or(0)) {
+                        self.send_acks()?;
+                        return Ok(m);
+                    }
+                    self.send_acks()?;
+                }
             }
         }
+    }
+
+    /// Acknowledges a QoS 1 or 2 PUBLISH (with `auto_ack`); false for a QoS 2 redelivery of a
+    /// message already returned (exactly once).
+    fn on_publish(&mut self, qos: u8, packet_id: u16) -> bool {
+        match qos {
+            1 if self.auto_ack => codec::puback(&mut self.acks, packet_id),
+            2 => {
+                if self.auto_ack {
+                    codec::pubrec(&mut self.acks, packet_id);
+                }
+                if self.qos2.contains(&packet_id) {
+                    return false;
+                }
+                self.qos2.push(packet_id);
+            }
+            _ => {}
+        }
+        true
+    }
+
+    /// PUBREL from the broker: answered with PUBCOMP.
+    fn released(&mut self, packet_id: u16) -> io::Result<()> {
+        self.qos2.retain(|&i| i != packet_id);
+        codec::pubcomp(&mut self.acks, packet_id);
+        self.send_acks()
+    }
+
+    /// Sends PUBREC for a QoS 2 message (when `auto_ack` is off).
+    pub fn pubrec(&mut self, packet_id: u16) -> io::Result<()> {
+        codec::pubrec(&mut self.acks, packet_id);
+        self.send_acks()
     }
 
     /// Calls `f` on each packet already buffered or read in one `read`; returns the first
@@ -196,12 +248,34 @@ impl Client {
         self.fill()?;
         let mut n = 0;
         while let Some((packet, len)) = codec::parse(&self.buf[self.start..]).map_err(io::Error::other)? {
-            if let Packet::Publish { payload, qos, packet_id, .. } = packet {
-                on_publish(payload);
-                n += 1;
-                if qos == 1 && self.auto_ack {
-                    codec::puback(&mut self.acks, packet_id.unwrap_or(0));
+            match packet {
+                Packet::Publish { payload, qos, packet_id, .. } => {
+                    let pid = packet_id.unwrap_or(0);
+                    let fresh = match qos {
+                        1 if self.auto_ack => {
+                            codec::puback(&mut self.acks, pid);
+                            true
+                        }
+                        2 => {
+                            codec::pubrec(&mut self.acks, pid);
+                            let fresh = !self.qos2.contains(&pid);
+                            if fresh {
+                                self.qos2.push(pid);
+                            }
+                            fresh
+                        }
+                        _ => true,
+                    };
+                    if fresh {
+                        on_publish(payload);
+                        n += 1;
+                    }
                 }
+                Packet::PubRel { packet_id } => {
+                    self.qos2.retain(|&i| i != packet_id);
+                    codec::pubcomp(&mut self.acks, packet_id);
+                }
+                _ => {}
             }
             self.start += len;
         }

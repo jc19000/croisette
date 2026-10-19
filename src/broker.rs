@@ -104,12 +104,15 @@ struct Opened {
     state: Undelivered,
 }
 
-/// QoS 1 messages of a session not acknowledged by its client: sent (packet id and encoding,
-/// redelivered with DUP) and not sent yet (QoS 0 encodings).
+/// QoS 1 and 2 state of a session: messages sent and not acknowledged (packet id and encoding,
+/// redelivered with DUP; an empty encoding is a QoS 2 message at the PUBREL step), messages not
+/// sent yet (QoS and QoS 0 encoding), and the ids of QoS 2 messages received from the client and
+/// not released yet.
 #[derive(Default)]
 struct Undelivered {
     inflight: Vec<(u16, Vec<u8>)>,
-    queue: VecDeque<Vec<u8>>,
+    queue: VecDeque<(u8, Vec<u8>)>,
+    received: Vec<u16>,
 }
 
 /// connection -> context: a clean-session connection with a client id closed.
@@ -298,8 +301,13 @@ impl Contexts {
                 inflight.append(&mut s.undelivered.inflight);
                 let mut queue = p.state.queue.clone();
                 queue.append(&mut s.undelivered.queue);
-                s.queued_bytes = queue.iter().map(Vec::len).sum();
-                s.undelivered = Undelivered { inflight, queue };
+                s.queued_bytes = queue.iter().map(|q| q.1.len()).sum();
+                let received = if p.state.received.is_empty() {
+                    std::mem::take(&mut s.undelivered.received)
+                } else {
+                    p.state.received.clone()
+                };
+                s.undelivered = Undelivered { inflight, queue, received };
                 s.state = SessionState::Offline;
             }
             _ => {
@@ -323,9 +331,9 @@ impl Contexts {
                     Deliver { packet: packet.to_vec(), conns: vec![(sub.1, qos)] },
                 );
             }
-            _ if qos == 1 && s.queued_bytes < self.max_queued => {
+            _ if qos > 0 && s.queued_bytes < self.max_queued => {
                 s.queued_bytes += packet.len();
-                s.undelivered.queue.push_back(packet.to_vec());
+                s.undelivered.queue.push_back((qos, packet.to_vec()));
             }
             _ => {} // QoS 0 messages are not kept for offline sessions
         }
@@ -394,16 +402,19 @@ struct OwnedWill {
     retain: bool,
 }
 
-/// QoS 1 messages to a connection: sent and waiting for PUBACK, or waiting for room in the
-/// in-flight window. Allocated with the first QoS 1 delivery.
+/// QoS 1 and 2 state of a connection, allocated with its first QoS 1 or 2 message: messages sent
+/// and waiting for PUBACK / PUBREC / PUBCOMP, messages waiting for room in the in-flight window,
+/// and QoS 2 messages received and not released.
 #[derive(Default)]
 struct Outbound {
     last_id: u16,
-    /// Packet id and encoding, kept for redelivery.
+    /// Packet id and encoding, kept for redelivery; empty once a QoS 2 message is at PUBREL.
     inflight: VecDeque<(u16, Vec<u8>)>,
-    /// QoS 0 encodings, given an id when they enter the window.
-    pending: VecDeque<Vec<u8>>,
+    /// QoS and QoS 0 encoding, given an id when they enter the window.
+    pending: VecDeque<(u8, Vec<u8>)>,
     pending_bytes: usize,
+    /// Ids of QoS 2 messages received from the client, until its PUBREL.
+    received: Vec<u16>,
 }
 
 impl Outbound {
@@ -416,11 +427,11 @@ impl Outbound {
         }
     }
 
-    /// Moves `packet` into the window: encoded with a fresh id at the end of `out`.
-    fn send(&mut self, out: &mut Vec<u8>, packet: &[u8]) {
+    /// Moves `packet` into the window: encoded at `qos` with a fresh id at the end of `out`.
+    fn send(&mut self, out: &mut Vec<u8>, packet: &[u8], qos: u8) {
         let id = self.next_id();
         let start = out.len();
-        codec::requalify(out, packet, 1, id);
+        codec::requalify(out, packet, qos, id);
         self.inflight.push_back((id, out[start..].to_vec()));
     }
 }
@@ -607,6 +618,7 @@ impl Connections {
                 if let Some(ob) = conn.outbound {
                     state.inflight = ob.inflight.into();
                     state.queue = ob.pending;
+                    state.received = ob.received;
                 }
                 let filters = conn.session.map(|_| conn.filters);
                 ctx.send(actor(partition, CONTEXT), Park { client_id, sub, filters, state });
@@ -717,7 +729,7 @@ impl Connections {
                     Box::new(OwnedWill {
                         topic: w.topic.into(),
                         payload: w.payload.to_vec(),
-                        qos: w.qos.min(1),
+                        qos: w.qos,
                         retain: w.retain,
                     })
                 });
@@ -735,6 +747,21 @@ impl Connections {
                 }
             }
             Packet::Publish { topic, payload, qos, retain, packet_id, .. } => {
+                if qos == 2 {
+                    // Routed once: a copy with the same id before PUBREL is a redelivery.
+                    let pid = packet_id.unwrap_or(0);
+                    let conn = self.get(id).unwrap();
+                    let ob = conn.outbound.get_or_insert_with(Default::default);
+                    let again = ob.received.contains(&pid);
+                    if !again {
+                        ob.received.push(pid);
+                    }
+                    codec::pubrec(&mut conn.out, pid);
+                    self.mark_dirty(ctx, id);
+                    if again {
+                        return Next::Continue;
+                    }
+                }
                 if retain {
                     let partition = self.topology.partition(topic);
                     ctx.send(actor(partition, CONTEXT), Retain { topic: topic.into(), payload: payload.to_vec(), qos });
@@ -743,14 +770,11 @@ impl Connections {
                 if qos == 1 {
                     codec::puback(&mut self.get(id).unwrap().out, packet_id.unwrap_or(0));
                     self.mark_dirty(ctx, id);
-                } else if qos == 2 {
-                    return Next::Close; // not supported yet
                 }
             }
             Packet::Subscribe { packet_id, filters } => {
                 let sub = (core, id);
-                // QoS 2 is granted as QoS 1 (allowed by the protocol).
-                let granted: Vec<u8> = filters.iter().map(|(_, q)| (*q).min(1)).collect();
+                let granted: Vec<u8> = filters.iter().map(|(_, q)| (*q).min(2)).collect();
                 for (&(filter, _), &qos) in filters.iter().zip(&granted) {
                     self.add_sub(ctx, filter, sub, qos);
                     for &other in &self.topology.cores {
@@ -781,7 +805,27 @@ impl Connections {
                 codec::pingresp(&mut self.get(id).unwrap().out);
                 self.mark_dirty(ctx, id);
             }
-            Packet::PubAck { packet_id } => self.acked(ctx, id, packet_id),
+            Packet::PubAck { packet_id } | Packet::PubComp { packet_id } => self.acked(ctx, id, packet_id),
+            Packet::PubRec { packet_id } => {
+                // QoS 2 to the client, step 2: keep the id until PUBCOMP, the message is theirs.
+                let conn = self.get(id).unwrap();
+                if let Some(ob) = conn.outbound.as_mut() {
+                    if let Some(e) = ob.inflight.iter_mut().find(|e| e.0 == packet_id) {
+                        e.1 = Vec::new();
+                    }
+                }
+                codec::pubrel(&mut conn.out, packet_id);
+                self.mark_dirty(ctx, id);
+            }
+            Packet::PubRel { packet_id } => {
+                // QoS 2 from the client, step 3: the message may come again with a new id.
+                let conn = self.get(id).unwrap();
+                if let Some(ob) = conn.outbound.as_mut() {
+                    ob.received.retain(|&r| r != packet_id);
+                }
+                codec::pubcomp(&mut conn.out, packet_id);
+                self.mark_dirty(ctx, id);
+            }
             Packet::Disconnect => {
                 self.get(id).unwrap().will = None; // a clean disconnect discards the will
                 return Next::Close;
@@ -869,10 +913,10 @@ impl Connections {
         } else {
             let ob = c.outbound.get_or_insert_with(Default::default);
             if ob.inflight.len() < max_inflight {
-                ob.send(&mut c.out, packet);
+                ob.send(&mut c.out, packet, qos);
             } else if ob.pending_bytes + c.out.len() < max_queued {
                 ob.pending_bytes += packet.len();
-                ob.pending.push_back(packet.to_vec());
+                ob.pending.push_back((qos, packet.to_vec()));
                 return;
             } else {
                 self.dropped += 1;
@@ -882,7 +926,8 @@ impl Connections {
         self.mark_dirty(ctx, id);
     }
 
-    /// PUBACK from connection `id`: frees a slot of its window for the next pending message.
+    /// PUBACK or PUBCOMP from connection `id`: frees a slot of its window for the next pending
+    /// message.
     fn acked(&mut self, ctx: &mut Context, id: u64, packet_id: u16) {
         let max_inflight = self.max_inflight;
         let Some(c) = self.get(id) else { return };
@@ -891,9 +936,9 @@ impl Connections {
         ob.inflight.remove(at);
         let mut sent = false;
         while ob.inflight.len() < max_inflight {
-            let Some(next) = ob.pending.pop_front() else { break };
+            let Some((qos, next)) = ob.pending.pop_front() else { break };
             ob.pending_bytes -= next.len();
-            ob.send(&mut c.out, &next);
+            ob.send(&mut c.out, &next, qos);
             sent = true;
         }
         if sent {
@@ -1017,7 +1062,11 @@ impl Handler<Opened> for Connections {
             if o.present {
                 let client_id = o.client_id.clone();
                 let partition = self.topology.partition(&client_id);
-                let state = Undelivered { inflight: o.state.inflight.clone(), queue: o.state.queue.clone() };
+                let state = Undelivered {
+                    inflight: o.state.inflight.clone(),
+                    queue: o.state.queue.clone(),
+                    received: o.state.received.clone(),
+                };
                 ctx.send(
                     actor(partition, CONTEXT),
                     Park { client_id, sub: (ctx.core() as u16, o.conn), filters: None, state },
@@ -1039,21 +1088,27 @@ impl Handler<Opened> for Connections {
         let max_inflight = self.max_inflight;
         let conn = self.get(o.conn).unwrap();
         conn.filters = o.filters.clone();
-        if !o.state.inflight.is_empty() || !o.state.queue.is_empty() {
+        if !o.state.inflight.is_empty() || !o.state.queue.is_empty() || !o.state.received.is_empty() {
             let ob = conn.outbound.get_or_insert_with(Default::default);
+            ob.received = o.state.received.clone();
             for (pid, packet) in &o.state.inflight {
-                let mut p = packet.clone();
-                codec::set_dup(&mut p);
-                conn.out.extend_from_slice(&p);
-                ob.inflight.push_back((*pid, p));
+                if packet.is_empty() {
+                    codec::pubrel(&mut conn.out, *pid); // QoS 2 at the PUBREL step
+                    ob.inflight.push_back((*pid, Vec::new()));
+                } else {
+                    let mut p = packet.clone();
+                    codec::set_dup(&mut p);
+                    conn.out.extend_from_slice(&p);
+                    ob.inflight.push_back((*pid, p));
+                }
                 ob.last_id = ob.last_id.max(*pid);
             }
-            for packet in &o.state.queue {
+            for (qos, packet) in &o.state.queue {
                 if ob.inflight.len() < max_inflight {
-                    ob.send(&mut conn.out, packet);
+                    ob.send(&mut conn.out, packet, *qos);
                 } else {
                     ob.pending_bytes += packet.len();
-                    ob.pending.push_back(packet.clone());
+                    ob.pending.push_back((*qos, packet.clone()));
                 }
             }
         }

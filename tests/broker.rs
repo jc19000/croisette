@@ -357,7 +357,7 @@ fn delivery_qos_is_the_lower_of_publish_and_subscription() {
     let (engine, addr) = start(vec![1, 2]);
     let mut s1 = client(addr, "s1");
     assert_eq!(s1.subscribe_qos(&["q/1"], 1).unwrap(), vec![1]);
-    assert_eq!(s1.subscribe_qos(&["q/2"], 2).unwrap(), vec![1], "QoS 2 is granted as QoS 1");
+    assert_eq!(s1.subscribe_qos(&["q/2"], 2).unwrap(), vec![2]);
     let mut s0 = client(addr, "s0");
     s0.subscribe(&["q/1"]).unwrap();
     let mut p = client(addr, "p");
@@ -593,23 +593,36 @@ fn takeover_moves_the_persistent_session() {
 }
 
 #[test]
-fn no_message_lost_across_reconnections() {
+fn no_qos1_message_lost_across_reconnections() {
+    no_message_lost_across_reconnections(1);
+}
+
+#[test]
+fn no_qos2_message_lost_across_reconnections() {
+    no_message_lost_across_reconnections(2);
+}
+
+fn no_message_lost_across_reconnections(qos: u8) {
     let _g = serial();
     let (engine, addr) = start(vec![1, 2]);
     let (mut dev, _) = persistent(addr, "dev");
-    dev.subscribe_qos(&["s"], 1).unwrap();
+    dev.subscribe_qos(&["s"], qos).unwrap();
     let n = 3000u32;
     let publisher = std::thread::spawn(move || {
         let mut p = client(addr, "p");
         for i in 0..n {
             // Batches of 10 without waiting, then the PUBACKs: the subscriber falls behind, so
             // reconnections find messages in flight and queued.
-            p.queue_publish("s", &i.to_be_bytes(), 1, false);
-            if i % 10 == 9 {
-                p.flush().unwrap();
-                for _ in 0..10 {
-                    p.wait_puback().unwrap();
+            if qos == 1 {
+                p.queue_publish("s", &i.to_be_bytes(), 1, false);
+                if i % 10 == 9 {
+                    p.flush().unwrap();
+                    for _ in 0..10 {
+                        p.wait_puback().unwrap();
+                    }
                 }
+            } else {
+                p.publish("s", &i.to_be_bytes(), 2, false).unwrap();
             }
         }
     });
@@ -647,5 +660,68 @@ fn no_message_lost_across_reconnections() {
     publisher.join().unwrap();
     assert_eq!(reconnects, 20);
     assert!(redelivered > 0, "reconnections happened with unacknowledged messages");
+    engine.shutdown();
+}
+
+// ---- QoS 2 --------------------------------------------------------------------------------------
+
+#[test]
+fn qos2_is_delivered_once() {
+    let _g = serial();
+    let (engine, addr) = start(vec![1, 2]);
+    let mut s2 = client(addr, "s2");
+    s2.subscribe_qos(&["x"], 2).unwrap();
+    let mut s1 = client(addr, "s1");
+    s1.subscribe_qos(&["x"], 1).unwrap();
+    let mut p = client(addr, "p");
+    p.publish("x", b"once", 2, false).unwrap(); // PUBLISH, PUBREC, PUBREL, PUBCOMP
+    let qos2 = Incoming::Publish { topic: "x".into(), payload: b"once".to_vec(), qos: 2, retain: false };
+    assert_eq!(s2.next_publish().unwrap(), qos2);
+    assert_eq!(s1.next_publish().unwrap(), qos1_msg("x", b"once", false));
+    // A publisher resending the same packet before PUBREL is not routed twice.
+    let mut raw = client(addr, "raw");
+    let mut b = Vec::new();
+    codec::publish(&mut b, "x", b"dup", 2, false, Some(7));
+    codec::publish(&mut b, "x", b"dup", 2, false, Some(7));
+    raw.stream.write_all(&b).unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    b.clear();
+    codec::pubrel(&mut b, 7);
+    // After PUBREL the id is free: the same id is a new message.
+    codec::publish(&mut b, "x", b"next", 2, false, Some(7));
+    raw.stream.write_all(&b).unwrap();
+    let dup = Incoming::Publish { topic: "x".into(), payload: b"dup".to_vec(), qos: 2, retain: false };
+    let next = Incoming::Publish { topic: "x".into(), payload: b"next".to_vec(), qos: 2, retain: false };
+    assert_eq!(s2.next_publish().unwrap(), dup);
+    assert_eq!(s2.next_publish().unwrap(), next);
+    assert_nothing(&mut s2);
+    engine.shutdown();
+}
+
+#[test]
+fn qos2_state_survives_reconnection() {
+    let _g = serial();
+    let (engine, addr) = start(vec![1, 2]);
+    let (mut dev, _) = persistent(addr, "dev");
+    dev.auto_ack = false;
+    dev.subscribe_qos(&["y"], 2).unwrap();
+    let mut p = client(addr, "p");
+    p.publish("y", b"1", 2, false).unwrap();
+    p.publish("y", b"2", 2, false).unwrap();
+    let msg = |v: &[u8]| Incoming::Publish { topic: "y".into(), payload: v.to_vec(), qos: 2, retain: false };
+    assert_eq!(dev.next_publish().unwrap(), msg(b"1"));
+    dev.pubrec(dev.last_packet_id.unwrap()).unwrap(); // "1" reaches the PUBREL step
+    assert_eq!(dev.next_publish().unwrap(), msg(b"2")); // "2" is not acknowledged at all
+    std::thread::sleep(Duration::from_millis(50));
+    drop(dev);
+    std::thread::sleep(Duration::from_millis(50));
+    let (mut dev, present) = persistent(addr, "dev");
+    assert!(present);
+    // "1" only gets its PUBREL again (answered by the client), "2" comes back as a DUP.
+    assert_eq!(dev.next_publish().unwrap(), msg(b"2"));
+    assert!(dev.last_dup);
+    assert_nothing(&mut dev);
+    p.publish("y", b"3", 2, false).unwrap();
+    assert_eq!(dev.next_publish().unwrap(), msg(b"3"));
     engine.shutdown();
 }

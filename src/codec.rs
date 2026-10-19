@@ -28,6 +28,9 @@ pub enum Packet<'a> {
     ConnAck { session_present: bool, code: u8 },
     Publish { topic: &'a str, payload: &'a [u8], qos: u8, retain: bool, dup: bool, packet_id: Option<u16> },
     PubAck { packet_id: u16 },
+    PubRec { packet_id: u16 },
+    PubRel { packet_id: u16 },
+    PubComp { packet_id: u16 },
     Subscribe { packet_id: u16, filters: Vec<(&'a str, u8)> },
     SubAck { packet_id: u16, codes: Vec<u8> },
     Unsubscribe { packet_id: u16, filters: Vec<&'a str> },
@@ -100,6 +103,12 @@ pub fn parse_limited(buf: &[u8], max: usize) -> Result<Option<(Packet<'_>, usize
         }
         3 => parse_publish(flags, body)?,
         4 => Packet::PubAck { packet_id: u16_at(body, 0)? },
+        5 => Packet::PubRec { packet_id: u16_at(body, 0)? },
+        6 => {
+            check(flags == 2, "pubrel flags")?;
+            Packet::PubRel { packet_id: u16_at(body, 0)? }
+        }
+        7 => Packet::PubComp { packet_id: u16_at(body, 0)? },
         8 => parse_subscribe(flags, body)?,
         9 => {
             let packet_id = u16_at(body, 0)?;
@@ -381,7 +390,23 @@ pub fn set_dup(packet: &mut [u8]) {
 }
 
 pub fn puback(out: &mut Vec<u8>, packet_id: u16) {
-    out.push(0x40);
+    ack(out, 0x40, packet_id);
+}
+
+pub fn pubrec(out: &mut Vec<u8>, packet_id: u16) {
+    ack(out, 0x50, packet_id);
+}
+
+pub fn pubrel(out: &mut Vec<u8>, packet_id: u16) {
+    ack(out, 0x62, packet_id);
+}
+
+pub fn pubcomp(out: &mut Vec<u8>, packet_id: u16) {
+    ack(out, 0x70, packet_id);
+}
+
+fn ack(out: &mut Vec<u8>, first: u8, packet_id: u16) {
+    out.push(first);
     out.push(2);
     out.extend_from_slice(&packet_id.to_be_bytes());
 }
@@ -448,6 +473,18 @@ mod tests {
         let mut want = Vec::new();
         publish(&mut want, "a/b", b"hello", 1, true, Some(42));
         assert_eq!(q1, want);
+        let mut q2 = Vec::new();
+        requalify(&mut q2, &q0, 2, 43);
+        assert!(matches!(roundtrip(&q2), Packet::Publish { qos: 2, packet_id: Some(43), retain: true, .. }));
+        for (encode, want) in [
+            (pubrec as fn(&mut Vec<u8>, u16), Packet::PubRec { packet_id: 9 }),
+            (pubrel, Packet::PubRel { packet_id: 9 }),
+            (pubcomp, Packet::PubComp { packet_id: 9 }),
+        ] {
+            let mut b = Vec::new();
+            encode(&mut b, 9);
+            assert_eq!(roundtrip(&b), want);
+        }
         set_dup(&mut q1);
         assert!(matches!(roundtrip(&q1), Packet::Publish { dup: true, qos: 1, packet_id: Some(42), .. }));
     }
