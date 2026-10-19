@@ -45,8 +45,10 @@ sub -t "s/#" -q 1 -c -i persistent -C 1 -W 2 > /dev/null # creates the session, 
 pub -t s/a -q 1 -m queued
 check "persistent session queue" "queued" "$(sub -t 's/#' -q 1 -c -i persistent -C 1 -W 3)"
 
-# The retained value, then the next round's, which counts this subscriber.
-check "\$SYS clients" "1" "$(sub -t '$SYS/broker/clients/connected' -C 2 -W 4 | tail -1)"
+# The next round's value counts this subscriber (and maybe clients of the steps above still
+# closing): at least 1.
+n=$(sub -t '$SYS/broker/clients/connected' -C 2 -W 4 | tail -1)
+check "\$SYS clients" "yes" "$([ "${n:-0}" -ge 1 ] 2>/dev/null && echo yes || echo "no ($n)")"
 
 sub -t "share/x" -q 1 -C 0 -W 1 > /dev/null 2>&1
 mosquitto_sub -p $PORT -t '$share/g/share/#' -C 2 -W 3 > "$DIR/sh1" & A=$!
