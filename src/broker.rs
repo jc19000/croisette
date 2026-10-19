@@ -25,6 +25,7 @@ use std::time::Duration;
 
 use cannes::{Actor, ActorId, ActorRef, Context, CoreId, CoreMode, Engine, Handler, IoCompletion, StartSequence};
 
+use crate::auth::{self, Auth, Rule};
 use crate::codec::{self, Packet};
 use crate::index::{Entry, Sub, SubIndex};
 use crate::net;
@@ -478,6 +479,8 @@ struct Conn {
     session: Option<u32>,
     /// Bytes received after CONNECT, held until the session is opened.
     held: Option<Vec<u8>>,
+    /// Access rules, when the broker has an ACL.
+    rules: Option<Box<[Rule]>>,
     /// Bytes waiting to be sent. (The receive buffer is always owned by the recv in flight.)
     out: Vec<u8>,
     sending: bool,
@@ -510,6 +513,7 @@ pub struct Connections {
     stats: Vec<Option<Stats>>,
     router: Option<ActorRef<Router>>,
     contexts: Option<ActorRef<Contexts>>,
+    auth: Option<Arc<Auth>>,
     /// Persistent-session connections closed in the last ticks: (context core, session id,
     /// tick). Messages routed to them before every router saw them go are sent on to the
     /// session.
@@ -574,6 +578,7 @@ impl Connections {
             persistent: false,
             session: None,
             held: None,
+            rules: None,
             out: Vec::new(),
             sending: false,
             dirty: false,
@@ -751,6 +756,7 @@ impl Connections {
     /// Handles one packet from connection `id`.
     fn handle(&mut self, ctx: &mut Context, id: u64, packet: Packet<'_>) -> Next {
         let core = self.core(ctx);
+        let auth = if matches!(packet, Packet::Connect(_)) { self.auth.clone() } else { None };
         let conn = self.get(id).unwrap();
         if conn.connected == matches!(packet, Packet::Connect(_)) {
             return Next::Close; // anything before CONNECT, or a second CONNECT
@@ -761,6 +767,8 @@ impl Connections {
                     1 // unacceptable protocol version
                 } else if c.client_id.is_empty() && !c.clean_session {
                     2 // identifier rejected
+                } else if let Some(a) = &auth {
+                    a.check(c.username, c.password)
                 } else {
                     0
                 };
@@ -770,7 +778,10 @@ impl Connections {
                 }
                 conn.connected = true;
                 conn.keep_alive = c.keep_alive;
-                conn.will = c.will.map(|w| {
+                conn.rules = auth.and_then(|a| a.rules(c.username, c.client_id)).map(Vec::into_boxed_slice);
+                let will_allowed = |topic: &str| conn.rules.as_ref().is_none_or(|r| auth::can_write(r, topic));
+                let will = c.will.filter(|w| will_allowed(w.topic));
+                conn.will = will.map(|w| {
                     Box::new(OwnedWill {
                         topic: w.topic.into(),
                         payload: w.payload.to_vec(),
@@ -792,6 +803,8 @@ impl Connections {
                 }
             }
             Packet::Publish { topic, payload, qos, retain, packet_id, .. } => {
+                // A publish the ACL denies is acknowledged as usual and not routed.
+                let allowed = conn.rules.as_ref().is_none_or(|r| auth::can_write(r, topic));
                 if qos == 2 {
                     // Routed once: a copy with the same id before PUBREL is a redelivery.
                     let pid = packet_id.unwrap_or(0);
@@ -803,9 +816,16 @@ impl Connections {
                     }
                     codec::pubrec(&mut conn.out, pid);
                     self.mark_dirty(ctx, id);
-                    if again {
+                    if again || !allowed {
                         return Next::Continue;
                     }
+                }
+                if !allowed {
+                    if qos == 1 {
+                        codec::puback(&mut self.get(id).unwrap().out, packet_id.unwrap_or(0));
+                        self.mark_dirty(ctx, id);
+                    }
+                    return Next::Continue;
                 }
                 self.received_msgs += 1;
                 if retain {
@@ -820,8 +840,15 @@ impl Connections {
             }
             Packet::Subscribe { packet_id, filters } => {
                 let sub = (core, id);
-                let granted: Vec<u8> = filters.iter().map(|(_, q)| (*q).min(2)).collect();
+                let rules = conn.rules.as_deref();
+                let granted: Vec<u8> = filters
+                    .iter()
+                    .map(|&(f, q)| if rules.is_none_or(|r| auth::can_read(r, f)) { q.min(2) } else { 0x80 })
+                    .collect();
                 for (&(filter, _), &qos) in filters.iter().zip(&granted) {
+                    if qos == 0x80 {
+                        continue; // refused
+                    }
                     self.add_sub(ctx, filter, sub, qos);
                     if crate::index::shared(filter).is_none() {
                         // Retained messages are not sent for shared subscriptions.
@@ -831,7 +858,7 @@ impl Connections {
                     }
                 }
                 let conn = self.get(id).unwrap();
-                for (&(f, _), &qos) in filters.iter().zip(&granted) {
+                for (&(f, _), &qos) in filters.iter().zip(&granted).filter(|(_, &q)| q != 0x80) {
                     match conn.filters.iter_mut().find(|g| &*g.0 == f) {
                         Some(g) => g.1 = qos,
                         None => conn.filters.push((f.into(), qos)),
@@ -1245,6 +1272,8 @@ pub struct Config {
     pub max_inflight: usize,
     /// Period of the `$SYS/broker/...` statistics (rounded to seconds; zero: none).
     pub sys_interval: Duration,
+    /// Credentials and ACL; `None`: anonymous access to everything.
+    pub auth: Option<Arc<Auth>>,
 }
 
 impl Default for Config {
@@ -1259,6 +1288,7 @@ impl Default for Config {
             max_queued: 4 << 20,
             max_inflight: 32,
             sys_interval: Duration::from_secs(10),
+            auth: None,
         }
     }
 }
@@ -1274,6 +1304,7 @@ pub fn start(config: &Config) -> std::io::Result<Engine> {
         let connect_timeout = config.connect_timeout.as_secs().max(1) as u32;
         let (max_packet, max_queued, max_inflight) = (config.max_packet, config.max_queued, config.max_inflight);
         let sys_interval = config.sys_interval.as_secs() as u32;
+        let auth = config.auth.clone();
         seq.core_mode(core, config.mode);
         seq.io_uring(core, 4096);
         // Added in this order on every core, so that their ids are known up front.
@@ -1307,6 +1338,7 @@ pub fn start(config: &Config) -> std::io::Result<Engine> {
             stats: Vec::new(),
             router: None,
             contexts: None,
+            auth: auth.clone(),
             forwards: HashMap::new(),
             conns: Vec::new(),
             generations: Vec::new(),

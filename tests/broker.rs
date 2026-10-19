@@ -807,3 +807,46 @@ fn shared_subscription_spreads_messages_over_the_group() {
     assert!(per_worker.iter().all(|&c| c >= n / 4), "{per_worker:?}");
     engine.shutdown();
 }
+
+// ---- Authentication and ACL ---------------------------------------------------------------------
+
+#[test]
+fn credentials_and_acl_are_enforced() {
+    let _g = serial();
+    let passwd = format!("alice:wonder\n{}\nadmin:root\n", croisette::auth::hash_password("bob", "builder"));
+    let acl = "user alice\ntopic readwrite sensors/#\nuser bob\ntopic write cmd/#\nuser admin\ntopic #\n";
+    let auth = croisette::auth::Auth::from_strs(&passwd, Some(acl), false).unwrap();
+    let config = Config { cores: vec![1, 2], auth: Some(std::sync::Arc::new(auth)), ..Config::default() };
+    let (engine, addr) = start_with(config);
+    let login = |user: &'static str, password: &'static [u8]| {
+        let c = Connect {
+            level: 4,
+            client_id: user,
+            keep_alive: 60,
+            clean_session: true,
+            username: Some(user),
+            password: Some(password),
+            ..Connect::default()
+        };
+        Client::connect_with(addr, &c).map(|(client, _)| client)
+    };
+    let refused = |r: std::io::Result<Client>| r.err().map(|e| e.to_string());
+    assert_eq!(refused(Client::connect(addr, "anon")), Some("CONNACK code 5".into()));
+    assert_eq!(refused(login("alice", b"nope")), Some("CONNACK code 4".into()));
+    assert_eq!(refused(login("bob", b"builder")), None);
+    let mut alice = login("alice", b"wonder").unwrap();
+    assert_eq!(alice.subscribe_qos(&["sensors/#", "secret/#"], 1).unwrap(), vec![1, 0x80]);
+    let mut admin = login("admin", b"root").unwrap();
+    admin.subscribe(&["#"]).unwrap();
+    admin.set_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut bob = login("bob", b"builder").unwrap();
+    bob.publish("secret/x", b"denied", 1, false).unwrap(); // acknowledged, not routed
+    bob.publish("cmd/go", b"ok", 1, false).unwrap();
+    assert_eq!(admin.next_publish().unwrap(), publish_msg("cmd/go", b"ok"));
+    alice.publish("sensors/t", b"21", 0, false).unwrap();
+    assert_eq!(admin.next_publish().unwrap(), publish_msg("sensors/t", b"21"));
+    alice.set_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(alice.next_publish().unwrap(), publish_msg("sensors/t", b"21"));
+    assert_nothing(&mut admin);
+    engine.shutdown();
+}
