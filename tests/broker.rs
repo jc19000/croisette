@@ -482,3 +482,170 @@ fn many_qos1_messages_keep_their_order() {
     drop(p);
     drain.join().unwrap();
 }
+
+// ---- Persistent sessions ------------------------------------------------------------------------
+
+fn persistent(addr: SocketAddr, id: &str) -> (Client, bool) {
+    let c = Connect { level: 4, client_id: id, keep_alive: 60, clean_session: false, ..Connect::default() };
+    let (client, present) = Client::connect_with(addr, &c).unwrap();
+    client.set_timeout(Some(Duration::from_secs(5))).unwrap();
+    (client, present)
+}
+
+fn assert_nothing(c: &mut Client) {
+    c.set_timeout(Some(Duration::from_millis(200))).unwrap();
+    assert!(c.next_publish().is_err(), "unexpected message");
+    c.set_timeout(Some(Duration::from_secs(5))).unwrap();
+}
+
+#[test]
+fn persistent_session_keeps_subscriptions_and_queues_qos1() {
+    let _g = serial();
+    let (engine, addr) = start(vec![1, 2]);
+    let (mut dev, present) = persistent(addr, "dev");
+    assert!(!present);
+    dev.subscribe_qos(&["cmd/#"], 1).unwrap();
+    dev.subscribe(&["info"]).unwrap();
+    dev.disconnect().unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    let mut p = client(addr, "p");
+    p.publish("cmd/a", b"1", 1, false).unwrap();
+    p.publish("cmd/b", b"2", 1, false).unwrap();
+    p.publish("cmd/c", b"3", 0, false).unwrap(); // QoS 0: not kept
+    p.publish("info", b"x", 1, false).unwrap(); // subscribed at QoS 0: not kept
+    std::thread::sleep(Duration::from_millis(50));
+    let (mut dev, present) = persistent(addr, "dev");
+    assert!(present);
+    assert_eq!(dev.next_publish().unwrap(), qos1_msg("cmd/a", b"1", false));
+    assert_eq!(dev.next_publish().unwrap(), qos1_msg("cmd/b", b"2", false));
+    assert_nothing(&mut dev);
+    // The subscriptions are back, without a new SUBSCRIBE.
+    p.publish("cmd/d", b"4", 1, false).unwrap();
+    p.publish("info", b"y", 0, false).unwrap();
+    assert_eq!(dev.next_publish().unwrap(), qos1_msg("cmd/d", b"4", false));
+    assert_eq!(dev.next_publish().unwrap(), publish_msg("info", b"y"));
+    assert_nothing(&mut dev);
+    engine.shutdown();
+}
+
+#[test]
+fn unacknowledged_messages_are_redelivered_with_dup() {
+    let _g = serial();
+    let (engine, addr) = start(vec![1, 2]);
+    let (mut dev, _) = persistent(addr, "dev");
+    dev.auto_ack = false;
+    dev.subscribe_qos(&["t"], 1).unwrap();
+    let mut p = client(addr, "p");
+    p.publish("t", b"1", 1, false).unwrap();
+    p.publish("t", b"2", 1, false).unwrap();
+    assert_eq!(dev.next_publish().unwrap(), qos1_msg("t", b"1", false));
+    dev.puback(dev.last_packet_id.unwrap()).unwrap();
+    assert_eq!(dev.next_publish().unwrap(), qos1_msg("t", b"2", false));
+    let second = dev.last_packet_id.unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    drop(dev); // without acknowledging "2"
+    std::thread::sleep(Duration::from_millis(50));
+    let (mut dev, present) = persistent(addr, "dev");
+    assert!(present);
+    assert_eq!(dev.next_publish().unwrap(), qos1_msg("t", b"2", false));
+    assert!(dev.last_dup);
+    assert_eq!(dev.last_packet_id, Some(second), "same packet id");
+    assert_nothing(&mut dev);
+    engine.shutdown();
+}
+
+#[test]
+fn clean_session_discards_the_persistent_one() {
+    let _g = serial();
+    let (engine, addr) = start(vec![1, 2]);
+    let (mut dev, _) = persistent(addr, "dev");
+    dev.subscribe_qos(&["z"], 1).unwrap();
+    dev.disconnect().unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    let mut p = client(addr, "p");
+    p.publish("z", b"queued", 1, false).unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    let mut clean = client(addr, "dev");
+    assert_nothing(&mut clean);
+    clean.disconnect().unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    p.publish("z", b"lost", 1, false).unwrap();
+    let (mut dev, present) = persistent(addr, "dev");
+    assert!(!present, "the clean session replaced it");
+    assert_nothing(&mut dev);
+    engine.shutdown();
+}
+
+#[test]
+fn takeover_moves_the_persistent_session() {
+    let _g = serial();
+    let (engine, addr) = start(vec![1, 2]);
+    let (mut first, _) = persistent(addr, "dev");
+    first.subscribe_qos(&["k"], 1).unwrap();
+    let (mut second, present) = persistent(addr, "dev");
+    assert!(present);
+    assert_closed_by_broker(&mut first.stream, Duration::from_secs(2));
+    let mut p = client(addr, "p");
+    p.publish("k", b"1", 1, false).unwrap();
+    assert_eq!(second.next_publish().unwrap(), qos1_msg("k", b"1", false));
+    assert_nothing(&mut second);
+    engine.shutdown();
+}
+
+#[test]
+fn no_message_lost_across_reconnections() {
+    let _g = serial();
+    let (engine, addr) = start(vec![1, 2]);
+    let (mut dev, _) = persistent(addr, "dev");
+    dev.subscribe_qos(&["s"], 1).unwrap();
+    let n = 3000u32;
+    let publisher = std::thread::spawn(move || {
+        let mut p = client(addr, "p");
+        for i in 0..n {
+            // Batches of 10 without waiting, then the PUBACKs: the subscriber falls behind, so
+            // reconnections find messages in flight and queued.
+            p.queue_publish("s", &i.to_be_bytes(), 1, false);
+            if i % 10 == 9 {
+                p.flush().unwrap();
+                for _ in 0..10 {
+                    p.wait_puback().unwrap();
+                }
+            }
+        }
+    });
+    let mut seen = vec![false; n as usize];
+    let mut count = 0;
+    let mut reconnects = 0;
+    let mut last_reconnect = 0;
+    let mut redelivered = 0;
+    while count < n {
+        match dev.next_publish() {
+            Ok(Incoming::Publish { payload, .. }) => {
+                let i = u32::from_be_bytes(payload[..4].try_into().unwrap()) as usize;
+                if dev.last_dup {
+                    redelivered += 1;
+                }
+                if !seen[i] {
+                    seen[i] = true;
+                    count += 1;
+                }
+                if count % 150 == 0 && reconnects < 20 && last_reconnect != count {
+                    last_reconnect = count;
+                    drop(dev); // abrupt, with messages in flight
+                    reconnects += 1;
+                    dev = persistent(addr, "dev").0;
+                }
+            }
+            Ok(other) => panic!("{other:?}"),
+            Err(e) => panic!(
+                "message {:?} missing: {e}; count {count} reconnects {reconnects} seen up to {:?}",
+                seen.iter().position(|&s| !s),
+                seen.iter().rposition(|&s| s)
+            ),
+        }
+    }
+    publisher.join().unwrap();
+    assert_eq!(reconnects, 20);
+    assert!(redelivered > 0, "reconnections happened with unacknowledged messages");
+    engine.shutdown();
+}

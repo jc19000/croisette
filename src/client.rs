@@ -17,6 +17,8 @@ pub struct Client {
     pub auto_ack: bool,
     /// Packet id of the last message returned by `next_publish` (QoS 1).
     pub last_packet_id: Option<u16>,
+    /// DUP flag of the last message returned by `next_publish` (a redelivery).
+    pub last_dup: bool,
 }
 
 /// A packet read from the broker, owned.
@@ -48,6 +50,7 @@ impl Client {
             next_id: 1,
             auto_ack: true,
             last_packet_id: None,
+            last_dup: false,
         };
         codec::connect_with(&mut c.out, connect);
         c.flush()?;
@@ -104,6 +107,11 @@ impl Client {
         Ok(())
     }
 
+    /// Waits for the PUBACK of a QoS 1 publish sent with `queue_publish`.
+    pub fn wait_puback(&mut self) -> io::Result<()> {
+        self.read_packet(|p| matches!(p, Packet::PubAck { .. })).map(|_| ())
+    }
+
     pub fn flush(&mut self) -> io::Result<()> {
         self.stream.write_all(&self.out)?;
         self.out.clear();
@@ -157,17 +165,20 @@ impl Client {
     pub fn next_publish(&mut self) -> io::Result<Incoming> {
         loop {
             let mut ack = None;
+            let mut last_dup = false;
             let got = self.try_parse(|p| match p {
-                Packet::Publish { topic, payload, qos, retain, packet_id, .. } => {
+                Packet::Publish { topic, payload, qos, retain, packet_id, dup } => {
                     if qos == 1 {
                         ack = packet_id;
                     }
+                    last_dup = dup;
                     Some(Incoming::Publish { topic: topic.to_string(), payload: payload.to_vec(), qos, retain })
                 }
                 other => Some(Incoming::Other(format!("{other:?}"))),
             })?;
             if got.is_some() {
                 self.last_packet_id = ack;
+                self.last_dup = last_dup;
             }
             if let (Some(id), true) = (ack, self.auto_ack) {
                 codec::puback(&mut self.acks, id);

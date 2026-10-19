@@ -86,14 +86,45 @@ struct RetainedQuery {
     qos: u8,
 }
 
-struct Register {
+/// connection -> context: a CONNECT with a client id. Answered by `Opened`.
+struct Open {
+    client_id: Box<str>,
+    sub: Sub,
+    clean: bool,
+}
+
+/// context -> connection: the session is the connection's. `present`: a persistent session
+/// existed, its subscriptions and undelivered messages come with it.
+struct Opened {
+    client_id: Box<str>,
+    conn: u64,
+    sid: u32,
+    present: bool,
+    filters: Vec<(Box<str>, u8)>,
+    state: Undelivered,
+}
+
+/// QoS 1 messages of a session not acknowledged by its client: sent (packet id and encoding,
+/// redelivered with DUP) and not sent yet (QoS 0 encodings).
+#[derive(Default)]
+struct Undelivered {
+    inflight: Vec<(u16, Vec<u8>)>,
+    queue: VecDeque<Vec<u8>>,
+}
+
+/// connection -> context: a clean-session connection with a client id closed.
+struct Unregister {
     client_id: Box<str>,
     sub: Sub,
 }
 
-struct Unregister {
+/// connection -> context: a persistent-session connection closed (or could not take its session),
+/// handing back the session's state. `filters`: its current subscriptions, if it had the session.
+struct Park {
     client_id: Box<str>,
     sub: Sub,
+    filters: Option<Vec<(Box<str>, u8)>>,
+    state: Undelivered,
 }
 
 /// Close a connection: its client id was taken over by a new connection.
@@ -129,16 +160,175 @@ impl Handler<SubRemove> for Router {
 // ---- Tier 3: retained messages and client-id registry ------------------------------------------
 
 pub struct Contexts {
+    topology: Arc<Topology>,
     retained: HashMap<Box<str>, (Vec<u8>, u8)>,
-    clients: HashMap<Box<str>, Sub>,
+    by_client: HashMap<Box<str>, u32>,
+    sessions: HashMap<u32, Session>,
+    next_sid: u32,
+    max_queued: usize,
 }
+
+/// A client id's session, on the context partition of the client id.
+struct Session {
+    client_id: Box<str>,
+    persistent: bool,
+    state: SessionState,
+    /// Subscriptions, kept while the session is offline (persistent sessions).
+    filters: Vec<(Box<str>, u8)>,
+    undelivered: Undelivered,
+    queued_bytes: usize,
+}
+
+enum SessionState {
+    Online(Sub),
+    /// Persistent session without connection: its subscriptions route to it (session targets).
+    Offline,
+    /// `old` was kicked for `new`, which waits for `old` to hand the session back.
+    TakingOver {
+        old: Sub,
+        new: Sub,
+        clean: bool,
+    },
+}
+
+/// Session targets: index entries `(context core, SESSION | sid)` route messages for an offline
+/// persistent session to its context partition.
+const SESSION: u64 = 1 << 60;
 
 impl Actor for Contexts {
     fn on_start(&mut self, ctx: &mut Context) {
         ctx.register_handler::<Retain, Self>();
         ctx.register_handler::<RetainedQuery, Self>();
-        ctx.register_handler::<Register, Self>();
+        ctx.register_handler::<Open, Self>();
         ctx.register_handler::<Unregister, Self>();
+        ctx.register_handler::<Park, Self>();
+    }
+}
+
+impl Contexts {
+    /// Gives session `sid` to connection `sub` (fresh session if `clean` or none): replies
+    /// `Opened`, with the state of a persistent session left offline.
+    fn open(&mut self, ctx: &mut Context, client_id: &str, sub: Sub, clean: bool) {
+        let existing = self.by_client.get(client_id).copied();
+        if let Some(sid) = existing {
+            let s = self.sessions.get_mut(&sid).unwrap();
+            match s.state {
+                SessionState::Online(old) if old != sub => {
+                    // Takeover: the old connection hands the session back when it closes.
+                    s.state = SessionState::TakingOver { old, new: sub, clean };
+                    ctx.send(actor(old.0 as CoreId, CONNECTIONS), Kick { conn: old.1 });
+                    return;
+                }
+                SessionState::TakingOver { old, new, .. } => {
+                    // A third connection: it replaces the one waiting.
+                    s.state = SessionState::TakingOver { old, new: sub, clean };
+                    ctx.send(actor(new.0 as CoreId, CONNECTIONS), Kick { conn: new.1 });
+                    return;
+                }
+                SessionState::Offline if !clean => {
+                    s.state = SessionState::Online(sub);
+                    s.queued_bytes = 0;
+                    let state = std::mem::take(&mut s.undelivered);
+                    let filters = s.filters.clone();
+                    ctx.send(
+                        actor(sub.0 as CoreId, CONNECTIONS),
+                        Opened { client_id: client_id.into(), conn: sub.1, sid, present: true, filters, state },
+                    );
+                    return;
+                }
+                _ => self.discard(ctx, sid),
+            }
+        }
+        let sid = self.next_sid;
+        self.next_sid = self.next_sid.wrapping_add(1);
+        self.by_client.insert(client_id.into(), sid);
+        self.sessions.insert(
+            sid,
+            Session {
+                client_id: client_id.into(),
+                persistent: !clean,
+                state: SessionState::Online(sub),
+                filters: Vec::new(),
+                undelivered: Undelivered::default(),
+                queued_bytes: 0,
+            },
+        );
+        let state = Undelivered::default();
+        ctx.send(
+            actor(sub.0 as CoreId, CONNECTIONS),
+            Opened { client_id: client_id.into(), conn: sub.1, sid, present: false, filters: Vec::new(), state },
+        );
+    }
+
+    /// Deletes a session, and its session targets if it was offline.
+    fn discard(&mut self, ctx: &mut Context, sid: u32) {
+        let Some(s) = self.sessions.remove(&sid) else { return };
+        self.by_client.remove(&s.client_id);
+        if matches!(s.state, SessionState::Offline) {
+            let target = (ctx.core() as u16, SESSION | sid as u64);
+            for (filter, _) in &s.filters {
+                for &core in &self.topology.cores {
+                    ctx.send(actor(core, ROUTER), SubRemove { filter: filter.clone(), sub: target });
+                }
+            }
+        }
+    }
+
+    /// The connection `sub` let go of the session of `client_id`, with `state` if persistent.
+    fn released(&mut self, ctx: &mut Context, client_id: &str, sub: Sub, park: Option<&Park>) {
+        let Some(&sid) = self.by_client.get(client_id) else { return };
+        let s = self.sessions.get_mut(&sid).unwrap();
+        let (owner, next) = match s.state {
+            SessionState::Online(o) => (o, None),
+            SessionState::TakingOver { old, new, clean } => (old, Some((new, clean))),
+            // A connection closed before it got its session: the session comes back from it.
+            SessionState::Offline if park.is_some() => (sub, None),
+            SessionState::Offline => return,
+        };
+        if owner != sub {
+            return; // stale
+        }
+        match park {
+            Some(p) if s.persistent => {
+                if let Some(filters) = &p.filters {
+                    s.filters = filters.clone();
+                }
+                // What comes back is older than what was queued meanwhile.
+                let mut inflight = p.state.inflight.clone();
+                inflight.append(&mut s.undelivered.inflight);
+                let mut queue = p.state.queue.clone();
+                queue.append(&mut s.undelivered.queue);
+                s.queued_bytes = queue.iter().map(Vec::len).sum();
+                s.undelivered = Undelivered { inflight, queue };
+                s.state = SessionState::Offline;
+            }
+            _ => {
+                self.sessions.remove(&sid);
+                self.by_client.remove(client_id);
+            }
+        }
+        if let Some((new, clean)) = next {
+            self.open(ctx, client_id, new, clean);
+        }
+    }
+
+    /// A message for session target `sid` (synchronous call from the connection tier of this
+    /// core): forwarded to the session's connection, or queued (QoS 1) while it is offline.
+    fn session_message(&mut self, ctx: &mut Context, sid: u32, packet: &[u8], qos: u8) {
+        let Some(s) = self.sessions.get_mut(&sid) else { return };
+        match s.state {
+            SessionState::Online(sub) => {
+                ctx.send(
+                    actor(sub.0 as CoreId, CONNECTIONS),
+                    Deliver { packet: packet.to_vec(), conns: vec![(sub.1, qos)] },
+                );
+            }
+            _ if qos == 1 && s.queued_bytes < self.max_queued => {
+                s.queued_bytes += packet.len();
+                s.undelivered.queue.push_back(packet.to_vec());
+            }
+            _ => {} // QoS 0 messages are not kept for offline sessions
+        }
     }
 }
 
@@ -164,22 +354,21 @@ impl Handler<RetainedQuery> for Contexts {
     }
 }
 
-impl Handler<Register> for Contexts {
-    fn on_event(&mut self, ctx: &mut Context, _src: ActorId, r: &Register) {
-        if let Some(old) = self.clients.insert(r.client_id.clone(), r.sub) {
-            if old != r.sub {
-                // Session takeover: the previous connection with this client id is closed.
-                ctx.send(actor(old.0 as CoreId, CONNECTIONS), Kick { conn: old.1 });
-            }
-        }
+impl Handler<Open> for Contexts {
+    fn on_event(&mut self, ctx: &mut Context, _src: ActorId, o: &Open) {
+        self.open(ctx, &o.client_id, o.sub, o.clean);
     }
 }
 
 impl Handler<Unregister> for Contexts {
-    fn on_event(&mut self, _ctx: &mut Context, _src: ActorId, u: &Unregister) {
-        if self.clients.get(&u.client_id) == Some(&u.sub) {
-            self.clients.remove(&u.client_id);
-        }
+    fn on_event(&mut self, ctx: &mut Context, _src: ActorId, u: &Unregister) {
+        self.released(ctx, &u.client_id, u.sub, None);
+    }
+}
+
+impl Handler<Park> for Contexts {
+    fn on_event(&mut self, ctx: &mut Context, _src: ActorId, p: &Park) {
+        self.released(ctx, &p.client_id, p.sub, Some(p));
     }
 }
 
@@ -243,6 +432,8 @@ enum Next {
     Close,
     /// Stop reading, send what is queued (a CONNACK refusing the connection), then close.
     CloseAfterFlush,
+    /// Stop reading until the session is opened (`Opened`).
+    WaitSession,
 }
 
 struct Conn {
@@ -252,14 +443,20 @@ struct Conn {
     keep_alive: u16,
     /// Tick of the last bytes received (or of the accept before that).
     last_rx: u32,
-    will: Option<OwnedWill>,
+    will: Option<Box<OwnedWill>>,
     close_after_flush: bool,
     outbound: Option<Box<Outbound>>,
+    /// CONNECT asked for a persistent session.
+    persistent: bool,
+    /// Session id, once `Opened`.
+    session: Option<u32>,
+    /// Bytes received after CONNECT, held until the session is opened.
+    held: Option<Vec<u8>>,
     /// Bytes waiting to be sent. (The receive buffer is always owned by the recv in flight.)
     out: Vec<u8>,
     sending: bool,
     dirty: bool,
-    filters: Vec<Box<str>>,
+    filters: Vec<(Box<str>, u8)>,
     client_id: Option<Box<str>>,
 }
 
@@ -275,6 +472,11 @@ pub struct Connections {
     /// Messages dropped because the subscriber's output queue was full.
     pub dropped: u64,
     router: Option<ActorRef<Router>>,
+    contexts: Option<ActorRef<Contexts>>,
+    /// Persistent-session connections closed in the last ticks: (context core, session id,
+    /// tick). Messages routed to them before every router saw them go are sent on to the
+    /// session.
+    forwards: HashMap<u64, (CoreId, u32, u32)>,
     conns: Vec<Option<Conn>>,
     generations: Vec<u32>,
     free: Vec<u32>,
@@ -332,6 +534,9 @@ impl Connections {
             will: None,
             close_after_flush: false,
             outbound: None,
+            persistent: false,
+            session: None,
+            held: None,
             out: Vec::new(),
             sending: false,
             dirty: false,
@@ -343,6 +548,25 @@ impl Connections {
         ctx.io().unwrap().recv(fd, Vec::with_capacity(RECV_BUF), token(RECV, id));
     }
 
+    /// Adds a subscription to this core's index and broadcasts it to the other cores.
+    fn add_sub(&mut self, ctx: &mut Context, filter: &str, sub: Sub, qos: u8) {
+        self.router.as_ref().unwrap().borrow_mut().index.add(filter, sub, qos);
+        for &core in &self.topology.cores {
+            if core != ctx.core() {
+                ctx.send(actor(core, ROUTER), SubAdd { filter: filter.into(), sub, qos });
+            }
+        }
+    }
+
+    fn remove_sub(&mut self, ctx: &mut Context, filter: &str, sub: Sub) {
+        self.router.as_ref().unwrap().borrow_mut().index.remove(filter, sub);
+        for &core in &self.topology.cores {
+            if core != ctx.core() {
+                ctx.send(actor(core, ROUTER), SubRemove { filter: filter.into(), sub });
+            }
+        }
+    }
+
     /// Closes connection `id`, publishing its will if it still has one (DISCONNECT clears it).
     fn close(&mut self, ctx: &mut Context, id: u64) {
         let index = (id & 0xffff_ffff) as usize;
@@ -351,13 +575,20 @@ impl Connections {
         self.free.push(index as u32);
         self.open -= 1;
         let sub = (self.core(ctx), id);
-        for filter in &conn.filters {
-            self.router.as_ref().unwrap().borrow_mut().index.remove(filter, sub);
-            for &core in &self.topology.cores {
-                if core != ctx.core() {
-                    ctx.send(actor(core, ROUTER), SubRemove { filter: filter.clone(), sub });
-                }
+        let parked = match (conn.persistent, conn.session, &conn.client_id) {
+            (true, Some(sid), Some(client_id)) => Some((self.topology.partition(client_id), sid)),
+            _ => None,
+        };
+        if let Some((partition, sid)) = parked {
+            self.forwards.insert(id, (partition, sid, self.tick));
+        }
+        for (filter, qos) in &conn.filters {
+            if let Some((partition, sid)) = parked {
+                // The session's subscriptions now route to the session, added before the
+                // connection's are removed so that no message falls in between.
+                self.add_sub(ctx, filter, (partition as u16, SESSION | sid as u64), *qos);
             }
+            self.remove_sub(ctx, filter, sub);
         }
         if let Some(will) = conn.will {
             if will.retain {
@@ -371,7 +602,17 @@ impl Connections {
         }
         if let Some(client_id) = conn.client_id {
             let partition = self.topology.partition(&client_id);
-            ctx.send(actor(partition, CONTEXT), Unregister { client_id, sub });
+            if conn.persistent {
+                let mut state = Undelivered::default();
+                if let Some(ob) = conn.outbound {
+                    state.inflight = ob.inflight.into();
+                    state.queue = ob.pending;
+                }
+                let filters = conn.session.map(|_| conn.filters);
+                ctx.send(actor(partition, CONTEXT), Park { client_id, sub, filters, state });
+            } else {
+                ctx.send(actor(partition, CONTEXT), Unregister { client_id, sub });
+            }
         }
         net::shutdown(conn.fd); // ends the pending recv and sends FIN
         ctx.io().unwrap().close(conn.fd, token(CLOSE, id));
@@ -391,6 +632,11 @@ impl Connections {
                         Next::Continue => {}
                         Next::Close => {
                             self.close(ctx, id);
+                            return;
+                        }
+                        Next::WaitSession => {
+                            buf.drain(..consumed);
+                            self.get(id).unwrap().held = Some(buf);
                             return;
                         }
                         Next::CloseAfterFlush => {
@@ -442,6 +688,7 @@ impl Connections {
         for id in expired {
             self.close(ctx, id);
         }
+        self.forwards.retain(|_, f| tick.wrapping_sub(f.2) <= 2);
     }
 
     /// Handles one packet from connection `id`.
@@ -460,25 +707,32 @@ impl Connections {
                 } else {
                     0
                 };
-                codec::connack(&mut conn.out, false, code);
                 if code != 0 {
+                    codec::connack(&mut conn.out, false, code);
                     return Next::CloseAfterFlush;
                 }
                 conn.connected = true;
                 conn.keep_alive = c.keep_alive;
-                conn.will = c.will.map(|w| OwnedWill {
-                    topic: w.topic.into(),
-                    payload: w.payload.to_vec(),
-                    qos: w.qos.min(1),
-                    retain: w.retain,
+                conn.will = c.will.map(|w| {
+                    Box::new(OwnedWill {
+                        topic: w.topic.into(),
+                        payload: w.payload.to_vec(),
+                        qos: w.qos.min(1),
+                        retain: w.retain,
+                    })
                 });
-                let client_id = c.client_id;
-                if !client_id.is_empty() {
-                    conn.client_id = Some(client_id.into());
-                    let partition = self.topology.partition(client_id);
-                    ctx.send(actor(partition, CONTEXT), Register { client_id: client_id.into(), sub: (core, id) });
+                conn.persistent = !c.clean_session;
+                if c.client_id.is_empty() {
+                    codec::connack(&mut conn.out, false, 0);
+                    self.mark_dirty(ctx, id);
+                } else {
+                    // CONNACK once the context partition of the client id has the session.
+                    conn.client_id = Some(c.client_id.into());
+                    let partition = self.topology.partition(c.client_id);
+                    let open = Open { client_id: c.client_id.into(), sub: (core, id), clean: c.clean_session };
+                    ctx.send(actor(partition, CONTEXT), open);
+                    return Next::WaitSession;
                 }
-                self.mark_dirty(ctx, id);
             }
             Packet::Publish { topic, payload, qos, retain, packet_id, .. } => {
                 if retain {
@@ -498,18 +752,16 @@ impl Connections {
                 // QoS 2 is granted as QoS 1 (allowed by the protocol).
                 let granted: Vec<u8> = filters.iter().map(|(_, q)| (*q).min(1)).collect();
                 for (&(filter, _), &qos) in filters.iter().zip(&granted) {
-                    self.router.as_ref().unwrap().borrow_mut().index.add(filter, sub, qos);
+                    self.add_sub(ctx, filter, sub, qos);
                     for &other in &self.topology.cores {
-                        if other != ctx.core() {
-                            ctx.send(actor(other, ROUTER), SubAdd { filter: filter.into(), sub, qos });
-                        }
                         ctx.send(actor(other, CONTEXT), RetainedQuery { filter: filter.into(), conn: id, qos });
                     }
                 }
                 let conn = self.get(id).unwrap();
-                for (f, _) in &filters {
-                    if !conn.filters.iter().any(|g| &**g == *f) {
-                        conn.filters.push((*f).into());
+                for (&(f, _), &qos) in filters.iter().zip(&granted) {
+                    match conn.filters.iter_mut().find(|g| &*g.0 == f) {
+                        Some(g) => g.1 = qos,
+                        None => conn.filters.push((f.into(), qos)),
                     }
                 }
                 codec::suback(&mut conn.out, packet_id, &granted);
@@ -518,15 +770,10 @@ impl Connections {
             Packet::Unsubscribe { packet_id, filters } => {
                 let sub = (core, id);
                 for filter in &filters {
-                    self.router.as_ref().unwrap().borrow_mut().index.remove(filter, sub);
-                    for &other in &self.topology.cores {
-                        if other != ctx.core() {
-                            ctx.send(actor(other, ROUTER), SubRemove { filter: (*filter).into(), sub });
-                        }
-                    }
+                    self.remove_sub(ctx, filter, sub);
                 }
                 let conn = self.get(id).unwrap();
-                conn.filters.retain(|f| !filters.contains(&&**f));
+                conn.filters.retain(|(f, _)| !filters.contains(&&**f));
                 codec::unsuback(&mut conn.out, packet_id);
                 self.mark_dirty(ctx, id);
             }
@@ -593,8 +840,26 @@ impl Connections {
     /// wait for room in it, or are dropped once `max_queued` bytes wait.
     #[inline]
     fn deliver(&mut self, ctx: &mut Context, id: u64, packet: &[u8], qos: u8) {
+        if id & SESSION != 0 {
+            let sid = (id & !SESSION) as u32;
+            self.contexts.as_ref().unwrap().borrow_mut().session_message(ctx, sid, packet, qos);
+            return;
+        }
         let (max_queued, max_inflight) = (self.max_queued, self.max_inflight);
-        let Some(c) = self.get(id) else { return };
+        let Some(c) = self.get(id) else {
+            if let Some(&(partition, sid, _)) = self.forwards.get(&id) {
+                let target = SESSION | sid as u64;
+                if partition == ctx.core() {
+                    self.deliver(ctx, target, packet, qos);
+                } else {
+                    ctx.send(
+                        actor(partition, CONNECTIONS),
+                        Deliver { packet: packet.to_vec(), conns: vec![(target, qos)] },
+                    );
+                }
+            }
+            return;
+        };
         if qos == 0 {
             if c.out.len() >= max_queued {
                 self.dropped += 1;
@@ -668,8 +933,11 @@ impl Actor for Connections {
         ctx.register_handler::<IoCompletion, Self>();
         ctx.register_handler::<Deliver, Self>();
         ctx.register_handler::<Kick, Self>();
+        ctx.register_handler::<Opened, Self>();
         let router = actor(ctx.core(), ROUTER);
         self.router = Some(ctx.reference_local_actor::<Router>(router).expect("router on this core"));
+        let contexts = actor(ctx.core(), CONTEXT);
+        self.contexts = Some(ctx.reference_local_actor::<Contexts>(contexts).expect("contexts on this core"));
         let mut io = ctx.io().expect("io_uring on broker cores");
         io.accept(self.listener, token(ACCEPT, 0));
         io.read(self.timer, Vec::with_capacity(8), 0, token(TIMER, 0));
@@ -742,6 +1010,58 @@ impl Handler<Deliver> for Connections {
     }
 }
 
+impl Handler<Opened> for Connections {
+    fn on_event(&mut self, ctx: &mut Context, _src: ActorId, o: &Opened) {
+        let Some(conn) = self.get(o.conn) else {
+            // Closed meanwhile (it parked an empty session): hand the session back.
+            if o.present {
+                let client_id = o.client_id.clone();
+                let partition = self.topology.partition(&client_id);
+                let state = Undelivered { inflight: o.state.inflight.clone(), queue: o.state.queue.clone() };
+                ctx.send(
+                    actor(partition, CONTEXT),
+                    Park { client_id, sub: (ctx.core() as u16, o.conn), filters: None, state },
+                );
+            }
+            return;
+        };
+        codec::connack(&mut conn.out, o.present, 0);
+        conn.session = Some(o.sid);
+        let held = conn.held.take().unwrap_or_default();
+        let core = ctx.core() as u16;
+        let partition = self.topology.partition(&o.client_id);
+        let target = (partition as u16, SESSION | o.sid as u64);
+        for (filter, qos) in &o.filters {
+            // The connection's entries first, then the session targets go: no gap.
+            self.add_sub(ctx, filter, (core, o.conn), *qos);
+            self.remove_sub(ctx, filter, target);
+        }
+        let max_inflight = self.max_inflight;
+        let conn = self.get(o.conn).unwrap();
+        conn.filters = o.filters.clone();
+        if !o.state.inflight.is_empty() || !o.state.queue.is_empty() {
+            let ob = conn.outbound.get_or_insert_with(Default::default);
+            for (pid, packet) in &o.state.inflight {
+                let mut p = packet.clone();
+                codec::set_dup(&mut p);
+                conn.out.extend_from_slice(&p);
+                ob.inflight.push_back((*pid, p));
+                ob.last_id = ob.last_id.max(*pid);
+            }
+            for packet in &o.state.queue {
+                if ob.inflight.len() < max_inflight {
+                    ob.send(&mut conn.out, packet);
+                } else {
+                    ob.pending_bytes += packet.len();
+                    ob.pending.push_back(packet.clone());
+                }
+            }
+        }
+        self.mark_dirty(ctx, o.conn);
+        self.received(ctx, o.conn, 1, held); // what came after CONNECT, then reads resume
+    }
+}
+
 impl Handler<Kick> for Connections {
     fn on_event(&mut self, ctx: &mut Context, _src: ActorId, k: &Kick) {
         self.close(ctx, k.conn);
@@ -794,7 +1114,15 @@ pub fn start(config: &Config) -> std::io::Result<Engine> {
         seq.io_uring(core, 4096);
         // Added in this order on every core, so that their ids are known up front.
         let r = seq.add_actor(core, || Router { index: SubIndex::new() });
-        let c = seq.add_actor(core, || Contexts { retained: HashMap::new(), clients: HashMap::new() });
+        let t = topology.clone();
+        let c = seq.add_actor(core, move || Contexts {
+            topology: t,
+            retained: HashMap::new(),
+            by_client: HashMap::new(),
+            sessions: HashMap::new(),
+            next_sid: 0,
+            max_queued,
+        });
         let t = topology.clone();
         let n = seq.add_actor(core, move || Connections {
             topology: t,
@@ -807,6 +1135,8 @@ pub fn start(config: &Config) -> std::io::Result<Engine> {
             max_inflight,
             dropped: 0,
             router: None,
+            contexts: None,
+            forwards: HashMap::new(),
             conns: Vec::new(),
             generations: Vec::new(),
             free: Vec::new(),
