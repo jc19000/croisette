@@ -1,0 +1,75 @@
+//! The few socket calls std does not offer: SO_REUSEPORT listeners and TCP_NODELAY on raw fds.
+
+use std::io;
+use std::net::Ipv4Addr;
+use std::os::fd::RawFd;
+
+#[repr(C)]
+struct SockAddrIn {
+    family: u16,
+    port: u16,
+    addr: u32,
+    zero: [u8; 8],
+}
+
+extern "C" {
+    fn socket(domain: i32, ty: i32, protocol: i32) -> i32;
+    fn setsockopt(fd: i32, level: i32, name: i32, value: *const i32, len: u32) -> i32;
+    fn bind(fd: i32, addr: *const SockAddrIn, len: u32) -> i32;
+    fn listen(fd: i32, backlog: i32) -> i32;
+    fn close(fd: i32) -> i32;
+    #[link_name = "shutdown"]
+    fn shutdown_fd(fd: i32, how: i32) -> i32;
+}
+
+const AF_INET: i32 = 2;
+const SOCK_STREAM: i32 = 1;
+const SOCK_CLOEXEC: i32 = 0o2000000;
+const SOL_SOCKET: i32 = 1;
+const SO_REUSEADDR: i32 = 2;
+const SO_REUSEPORT: i32 = 15;
+const IPPROTO_TCP: i32 = 6;
+const TCP_NODELAY: i32 = 1;
+
+fn check(ret: i32) -> io::Result<i32> {
+    if ret < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(ret)
+    }
+}
+
+fn set_int(fd: RawFd, level: i32, name: i32, value: i32) -> io::Result<()> {
+    check(unsafe { setsockopt(fd, level, name, &value, 4) }).map(|_| ())
+}
+
+/// A listening TCP socket with SO_REUSEPORT: one per core on the same port, and the kernel
+/// spreads incoming connections across them. TCP_NODELAY is set on the listener and inherited by
+/// accepted sockets.
+pub fn reuseport_listener(ip: Ipv4Addr, port: u16, backlog: i32) -> io::Result<RawFd> {
+    let fd = check(unsafe { socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0) })?;
+    let setup = (|| {
+        set_int(fd, SOL_SOCKET, SO_REUSEADDR, 1)?;
+        set_int(fd, SOL_SOCKET, SO_REUSEPORT, 1)?;
+        set_int(fd, IPPROTO_TCP, TCP_NODELAY, 1)?;
+        let addr = SockAddrIn { family: AF_INET as u16, port: port.to_be(), addr: u32::from(ip).to_be(), zero: [0; 8] };
+        check(unsafe { bind(fd, &addr, std::mem::size_of::<SockAddrIn>() as u32) })?;
+        check(unsafe { listen(fd, backlog) })?;
+        Ok(())
+    })();
+    match setup {
+        Ok(()) => Ok(fd),
+        Err(e) => {
+            unsafe { close(fd) };
+            Err(e)
+        }
+    }
+}
+
+/// Shuts both directions of a socket: sends FIN and completes any recv still in flight on it.
+/// Needed before closing a socket that io_uring has a pending operation on: the operation holds
+/// a reference to the file, so a close alone would leave the connection open.
+pub fn shutdown(fd: RawFd) {
+    const SHUT_RDWR: i32 = 2;
+    unsafe { shutdown_fd(fd, SHUT_RDWR) };
+}

@@ -1,0 +1,405 @@
+//! MQTT 3.1.1 packets: zero-copy parsing (packets borrow the receive buffer) and encoding into a
+//! caller-owned `Vec<u8>`, for both the broker and the load generator.
+
+use std::fmt;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Error {
+    /// Malformed packet: the connection must be closed.
+    Malformed(&'static str),
+    /// Packet larger than the configured maximum.
+    TooLarge,
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::Malformed(why) => write!(f, "malformed packet: {why}"),
+            Error::TooLarge => f.write_str("packet too large"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Packet<'a> {
+    Connect { client_id: &'a str, keep_alive: u16, clean_session: bool },
+    ConnAck { session_present: bool, code: u8 },
+    Publish { topic: &'a str, payload: &'a [u8], qos: u8, retain: bool, dup: bool, packet_id: Option<u16> },
+    PubAck { packet_id: u16 },
+    Subscribe { packet_id: u16, filters: Vec<(&'a str, u8)> },
+    SubAck { packet_id: u16, codes: Vec<u8> },
+    Unsubscribe { packet_id: u16, filters: Vec<&'a str> },
+    UnsubAck { packet_id: u16 },
+    PingReq,
+    PingResp,
+    Disconnect,
+}
+
+pub const MAX_PACKET: usize = 1 << 20;
+
+/// Parses one packet at the start of `buf`. `Ok(None)`: incomplete, wait for more bytes.
+/// `Ok(Some((packet, len)))`: `len` bytes consumed.
+pub fn parse(buf: &[u8]) -> Result<Option<(Packet<'_>, usize)>, Error> {
+    if buf.len() < 2 {
+        return Ok(None);
+    }
+    let (rem, var_len) = match remaining_length(&buf[1..])? {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    if rem > MAX_PACKET {
+        return Err(Error::TooLarge);
+    }
+    let total = 1 + var_len + rem;
+    if buf.len() < total {
+        return Ok(None);
+    }
+    let flags = buf[0] & 0x0f;
+    let body = &buf[1 + var_len..total];
+    let packet = match buf[0] >> 4 {
+        1 => parse_connect(body)?,
+        2 => {
+            check(body.len() == 2, "connack length")?;
+            Packet::ConnAck { session_present: body[0] & 1 == 1, code: body[1] }
+        }
+        3 => parse_publish(flags, body)?,
+        4 => Packet::PubAck { packet_id: u16_at(body, 0)? },
+        8 => parse_subscribe(flags, body)?,
+        9 => {
+            let packet_id = u16_at(body, 0)?;
+            Packet::SubAck { packet_id, codes: body[2..].to_vec() }
+        }
+        10 => parse_unsubscribe(flags, body)?,
+        11 => Packet::UnsubAck { packet_id: u16_at(body, 0)? },
+        12 => Packet::PingReq,
+        13 => Packet::PingResp,
+        14 => Packet::Disconnect,
+        _ => return Err(Error::Malformed("unsupported packet type")),
+    };
+    Ok(Some((packet, total)))
+}
+
+fn check(ok: bool, why: &'static str) -> Result<(), Error> {
+    if ok {
+        Ok(())
+    } else {
+        Err(Error::Malformed(why))
+    }
+}
+
+fn remaining_length(buf: &[u8]) -> Result<Option<(usize, usize)>, Error> {
+    let mut value = 0usize;
+    for (i, &b) in buf.iter().take(4).enumerate() {
+        value |= ((b & 0x7f) as usize) << (7 * i);
+        if b & 0x80 == 0 {
+            return Ok(Some((value, i + 1)));
+        }
+    }
+    if buf.len() >= 4 {
+        Err(Error::Malformed("remaining length"))
+    } else {
+        Ok(None)
+    }
+}
+
+fn u16_at(buf: &[u8], at: usize) -> Result<u16, Error> {
+    match buf.get(at..at + 2) {
+        Some(b) => Ok(u16::from_be_bytes([b[0], b[1]])),
+        None => Err(Error::Malformed("truncated")),
+    }
+}
+
+/// A length-prefixed UTF-8 string at `at`; returns it and the offset after it.
+fn str_at(buf: &[u8], at: usize) -> Result<(&str, usize), Error> {
+    let len = u16_at(buf, at)? as usize;
+    let bytes = buf.get(at + 2..at + 2 + len).ok_or(Error::Malformed("truncated string"))?;
+    let s = std::str::from_utf8(bytes).map_err(|_| Error::Malformed("invalid UTF-8"))?;
+    Ok((s, at + 2 + len))
+}
+
+fn parse_connect(body: &[u8]) -> Result<Packet<'_>, Error> {
+    let (name, at) = str_at(body, 0)?;
+    check(name == "MQTT" || name == "MQIsdp", "protocol name")?;
+    let flags = *body.get(at + 1).ok_or(Error::Malformed("truncated connect"))?;
+    let keep_alive = u16_at(body, at + 2)?;
+    let (client_id, _) = str_at(body, at + 4)?;
+    // Will, user name and password, when present, follow; the PoC accepts and ignores them.
+    Ok(Packet::Connect { client_id, keep_alive, clean_session: flags & 0x02 != 0 })
+}
+
+fn parse_publish(flags: u8, body: &[u8]) -> Result<Packet<'_>, Error> {
+    let qos = (flags >> 1) & 3;
+    check(qos < 3, "qos")?;
+    let (topic, mut at) = str_at(body, 0)?;
+    check(!topic.is_empty() && !topic.contains(['+', '#']), "publish topic")?;
+    let packet_id = if qos > 0 {
+        let id = u16_at(body, at)?;
+        at += 2;
+        Some(id)
+    } else {
+        None
+    };
+    Ok(Packet::Publish { topic, payload: &body[at..], qos, retain: flags & 1 == 1, dup: flags & 8 != 0, packet_id })
+}
+
+fn parse_subscribe(flags: u8, body: &[u8]) -> Result<Packet<'_>, Error> {
+    check(flags == 2, "subscribe flags")?;
+    let packet_id = u16_at(body, 0)?;
+    let mut at = 2;
+    let mut filters = Vec::new();
+    while at < body.len() {
+        let (filter, next) = str_at(body, at)?;
+        let qos = *body.get(next).ok_or(Error::Malformed("truncated subscribe"))?;
+        check(valid_filter(filter), "topic filter")?;
+        filters.push((filter, qos & 3));
+        at = next + 1;
+    }
+    check(!filters.is_empty(), "empty subscribe")?;
+    Ok(Packet::Subscribe { packet_id, filters })
+}
+
+fn parse_unsubscribe(flags: u8, body: &[u8]) -> Result<Packet<'_>, Error> {
+    check(flags == 2, "unsubscribe flags")?;
+    let packet_id = u16_at(body, 0)?;
+    let mut at = 2;
+    let mut filters = Vec::new();
+    while at < body.len() {
+        let (filter, next) = str_at(body, at)?;
+        filters.push(filter);
+        at = next;
+    }
+    Ok(Packet::Unsubscribe { packet_id, filters })
+}
+
+/// `+` must fill a whole level; `#` must be last and fill a whole level.
+pub fn valid_filter(filter: &str) -> bool {
+    if filter.is_empty() {
+        return false;
+    }
+    let levels: Vec<&str> = filter.split('/').collect();
+    for (i, level) in levels.iter().enumerate() {
+        if level.contains('#') && (*level != "#" || i != levels.len() - 1) {
+            return false;
+        }
+        if level.contains('+') && *level != "+" {
+            return false;
+        }
+    }
+    true
+}
+
+/// MQTT matching of `topic` against `filter`, including the rule that wildcards at the first
+/// level do not match topics starting with `$`.
+pub fn matches(filter: &str, topic: &str) -> bool {
+    if topic.starts_with('$') && (filter.starts_with('+') || filter.starts_with('#')) {
+        return false;
+    }
+    let mut f = filter.split('/');
+    let mut t = topic.split('/');
+    loop {
+        match (f.next(), t.next()) {
+            (Some("#"), _) => return true,
+            (Some("+"), Some(_)) => {}
+            (Some(a), Some(b)) if a == b => {}
+            (None, None) => return true,
+            _ => return false,
+        }
+    }
+}
+
+// ---- Encoding ------------------------------------------------------------------------------
+
+fn put_header(out: &mut Vec<u8>, first: u8, remaining: usize) {
+    out.push(first);
+    let mut x = remaining;
+    loop {
+        let mut b = (x % 128) as u8;
+        x /= 128;
+        if x > 0 {
+            b |= 0x80;
+        }
+        out.push(b);
+        if x == 0 {
+            break;
+        }
+    }
+}
+
+fn put_str(out: &mut Vec<u8>, s: &str) {
+    out.extend_from_slice(&(s.len() as u16).to_be_bytes());
+    out.extend_from_slice(s.as_bytes());
+}
+
+pub fn connect(out: &mut Vec<u8>, client_id: &str, keep_alive: u16, clean_session: bool) {
+    put_header(out, 0x10, 10 + 2 + client_id.len());
+    put_str(out, "MQTT");
+    out.push(4); // protocol level 3.1.1
+    out.push(if clean_session { 0x02 } else { 0 });
+    out.extend_from_slice(&keep_alive.to_be_bytes());
+    put_str(out, client_id);
+}
+
+pub fn connack(out: &mut Vec<u8>, session_present: bool, code: u8) {
+    out.extend_from_slice(&[0x20, 2, session_present as u8, code]);
+}
+
+pub fn publish(out: &mut Vec<u8>, topic: &str, payload: &[u8], qos: u8, retain: bool, packet_id: Option<u16>) {
+    let id_len = if qos > 0 { 2 } else { 0 };
+    put_header(out, 0x30 | (qos << 1) | retain as u8, 2 + topic.len() + id_len + payload.len());
+    put_str(out, topic);
+    if qos > 0 {
+        out.extend_from_slice(&packet_id.unwrap_or(1).to_be_bytes());
+    }
+    out.extend_from_slice(payload);
+}
+
+pub fn puback(out: &mut Vec<u8>, packet_id: u16) {
+    out.push(0x40);
+    out.push(2);
+    out.extend_from_slice(&packet_id.to_be_bytes());
+}
+
+pub fn subscribe(out: &mut Vec<u8>, packet_id: u16, filters: &[(&str, u8)]) {
+    let len = 2 + filters.iter().map(|(f, _)| 3 + f.len()).sum::<usize>();
+    put_header(out, 0x82, len);
+    out.extend_from_slice(&packet_id.to_be_bytes());
+    for (f, qos) in filters {
+        put_str(out, f);
+        out.push(*qos);
+    }
+}
+
+pub fn suback(out: &mut Vec<u8>, packet_id: u16, codes: &[u8]) {
+    put_header(out, 0x90, 2 + codes.len());
+    out.extend_from_slice(&packet_id.to_be_bytes());
+    out.extend_from_slice(codes);
+}
+
+pub fn unsubscribe(out: &mut Vec<u8>, packet_id: u16, filters: &[&str]) {
+    let len = 2 + filters.iter().map(|f| 2 + f.len()).sum::<usize>();
+    put_header(out, 0xa2, len);
+    out.extend_from_slice(&packet_id.to_be_bytes());
+    for f in filters {
+        put_str(out, f);
+    }
+}
+
+pub fn unsuback(out: &mut Vec<u8>, packet_id: u16) {
+    out.push(0xb0);
+    out.push(2);
+    out.extend_from_slice(&packet_id.to_be_bytes());
+}
+
+pub fn pingreq(out: &mut Vec<u8>) {
+    out.extend_from_slice(&[0xc0, 0]);
+}
+
+pub fn pingresp(out: &mut Vec<u8>) {
+    out.extend_from_slice(&[0xd0, 0]);
+}
+
+pub fn disconnect(out: &mut Vec<u8>) {
+    out.extend_from_slice(&[0xe0, 0]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn roundtrip(bytes: &[u8]) -> Packet<'_> {
+        let (p, len) = parse(bytes).unwrap().unwrap();
+        assert_eq!(len, bytes.len());
+        p
+    }
+
+    #[test]
+    fn packets_roundtrip() {
+        let mut b = Vec::new();
+        connect(&mut b, "client-1", 30, true);
+        assert_eq!(roundtrip(&b), Packet::Connect { client_id: "client-1", keep_alive: 30, clean_session: true });
+
+        let mut b = Vec::new();
+        publish(&mut b, "a/b", b"hello", 1, true, Some(7));
+        assert_eq!(
+            roundtrip(&b),
+            Packet::Publish { topic: "a/b", payload: b"hello", qos: 1, retain: true, dup: false, packet_id: Some(7) }
+        );
+
+        let mut b = Vec::new();
+        subscribe(&mut b, 3, &[("a/+", 0), ("b/#", 1)]);
+        assert_eq!(roundtrip(&b), Packet::Subscribe { packet_id: 3, filters: vec![("a/+", 0), ("b/#", 1)] });
+
+        let mut b = Vec::new();
+        suback(&mut b, 3, &[0, 0]);
+        assert_eq!(roundtrip(&b), Packet::SubAck { packet_id: 3, codes: vec![0, 0] });
+
+        let mut b = Vec::new();
+        unsubscribe(&mut b, 4, &["a/+"]);
+        assert_eq!(roundtrip(&b), Packet::Unsubscribe { packet_id: 4, filters: vec!["a/+"] });
+
+        for (enc, want) in [
+            (pingreq as fn(&mut Vec<u8>), Packet::PingReq),
+            (pingresp, Packet::PingResp),
+            (disconnect, Packet::Disconnect),
+        ] {
+            let mut b = Vec::new();
+            enc(&mut b);
+            assert_eq!(roundtrip(&b), want);
+        }
+    }
+
+    #[test]
+    fn large_payload_and_partial_input() {
+        let payload = vec![7u8; 300_000];
+        let mut b = Vec::new();
+        publish(&mut b, "big", &payload, 0, false, None);
+        for cut in [0, 1, 2, 4, b.len() - 1] {
+            assert_eq!(parse(&b[..cut]).unwrap(), None);
+        }
+        match roundtrip(&b) {
+            Packet::Publish { payload: p, .. } => assert_eq!(p.len(), 300_000),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn several_packets_in_one_buffer() {
+        let mut b = Vec::new();
+        pingreq(&mut b);
+        publish(&mut b, "t", b"x", 0, false, None);
+        let (p1, n1) = parse(&b).unwrap().unwrap();
+        assert_eq!(p1, Packet::PingReq);
+        let (p2, n2) = parse(&b[n1..]).unwrap().unwrap();
+        assert!(matches!(p2, Packet::Publish { topic: "t", .. }));
+        assert_eq!(n1 + n2, b.len());
+    }
+
+    #[test]
+    fn topic_matching() {
+        assert!(matches("a/b", "a/b"));
+        assert!(!matches("a/b", "a/c"));
+        assert!(matches("a/+", "a/b"));
+        assert!(!matches("a/+", "a/b/c"));
+        assert!(matches("a/#", "a/b/c"));
+        assert!(matches("a/#", "a"));
+        assert!(matches("#", "x/y"));
+        assert!(matches("+/+", "x/y"));
+        assert!(!matches("#", "$SYS/x"));
+        assert!(!matches("+/x", "$SYS/x"));
+        assert!(matches("$SYS/#", "$SYS/x"));
+        assert!(valid_filter("a/+/b/#"));
+        assert!(!valid_filter("a/b#"));
+        assert!(!valid_filter("a/#/b"));
+        assert!(!valid_filter("a+/b"));
+    }
+
+    #[test]
+    fn malformed_input_is_rejected() {
+        assert!(parse(&[0x30, 0xff, 0xff, 0xff, 0xff]).is_err());
+        let mut b = Vec::new();
+        publish(&mut b, "a/+", b"x", 0, false, None);
+        assert!(parse(&b).is_err());
+    }
+}
