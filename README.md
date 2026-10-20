@@ -160,6 +160,11 @@ lost). Records carry a CRC; a torn last record is ignored.
   broker crash.
 - `--durable-qos 2`: log only QoS 2 messages (default 1: QoS 1 and 2).
 
+**Conflation:** `--conflate FILTER` (repeatable) bounds the queues of offline sessions for
+state-like topics (telemetry, device shadows): a message on a matching topic replaces the one of
+the same topic already queued, at its place. A device back after a day gets the last value of
+each such topic, not 86 400 of them; commands on other topics keep their full history.
+
 On the test VM a synchronous 4 KB write takes about 400 µs, yet QoS 1 at 200 000 msg/s (10
 publishers, one core) runs as fast with `--storage wal --fsync batch` as with snapshots only
 (4.7 CPU-seconds per million messages both), since each flush carries about 80 messages.
@@ -168,7 +173,7 @@ publishers, one core) runs as fast with `--storage wal --fsync batch` as with sn
 
 **Tests:**
 
-- `tests/broker.rs`: 36 end-to-end tests with real TCP, TLS and WebSocket clients, MQTT 5 and
+- `tests/broker.rs`: 37 end-to-end tests with real TCP, TLS and WebSocket clients, MQTT 5 and
   3.1.1, on two cores, including a restart from snapshots and a kill -9 with the write-ahead log.
 - Unit tests for the codec, the index and authentication.
 - `tests/interop.sh`: 20 checks with `mosquitto_pub` / `mosquitto_sub`, MQTT 5, TLS and restart
@@ -182,7 +187,7 @@ croisette [--port 1883] [--cores 1,2] [--mode MODE] [--max-queued BYTES] [--max-
           [--passwd FILE] [--acl FILE] [--allow-anonymous true|false]
           [--tls-cert PEM --tls-key PEM [--tls-port 8883] [--wss-port P]] [--ws-port P]
           [--persist-dir DIR [--autosave S] [--storage none|snapshot|wal]
-           [--fsync batch|interval:<ms>|never] [--durable-qos 1|2]]
+           [--fsync batch|interval:<ms>|never] [--durable-qos 1|2]] [--conflate FILTER]...
 croisette hash-password USER PASSWORD
 ```
 

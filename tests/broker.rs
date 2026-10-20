@@ -536,6 +536,38 @@ fn persistent_session_keeps_subscriptions_and_queues_qos1() {
 }
 
 #[test]
+fn conflated_topics_keep_their_last_message_while_offline() {
+    let _g = serial();
+    let (engine, addr) =
+        start_with(Config { cores: vec![1, 2], conflate: vec!["telemetry/#".into()].into(), ..Config::default() });
+    let (mut dev, _) = persistent(addr, "dev");
+    dev.subscribe_qos(&["telemetry/#", "cmd/#"], 1).unwrap();
+    dev.disconnect().unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    let mut p = client(addr, "p");
+    for (topic, payload) in [
+        ("telemetry/a", "1"),
+        ("telemetry/a", "2"),
+        ("cmd/x", "c1"),
+        ("telemetry/b", "b1"),
+        ("cmd/x", "c2"),
+        ("telemetry/a", "3"),
+    ] {
+        p.publish(topic, payload.as_bytes(), 1, false).unwrap();
+    }
+    std::thread::sleep(Duration::from_millis(50));
+    let (mut dev, present) = persistent(addr, "dev");
+    assert!(present);
+    // The last value of each conflated topic, where its first one was; the history of the others.
+    assert_eq!(dev.next_publish().unwrap(), qos1_msg("telemetry/a", b"3", false));
+    assert_eq!(dev.next_publish().unwrap(), qos1_msg("cmd/x", b"c1", false));
+    assert_eq!(dev.next_publish().unwrap(), qos1_msg("telemetry/b", b"b1", false));
+    assert_eq!(dev.next_publish().unwrap(), qos1_msg("cmd/x", b"c2", false));
+    assert_nothing(&mut dev);
+    engine.shutdown();
+}
+
+#[test]
 fn unacknowledged_messages_are_redelivered_with_dup() {
     let _g = serial();
     let (engine, addr) = start(vec![1, 2]);

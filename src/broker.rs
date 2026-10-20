@@ -287,6 +287,8 @@ pub struct Contexts {
     wills: HashMap<Box<str>, (u64, Box<OwnedWill>)>,
     /// Session ends go to the write-ahead log.
     wal: bool,
+    /// Filters of the topics whose queued messages are conflated (see `queue_message`).
+    conflate: Arc<[Box<str>]>,
 }
 
 /// A client id's session, on the context partition of the client id.
@@ -399,8 +401,11 @@ impl Contexts {
         for x in saved.sessions {
             let sid = self.next_sid;
             self.next_sid += 1;
-            let queue: VecDeque<(u8, Msg)> = x.queue.into();
-            let queued_bytes = queue.iter().map(|q| q.1.packet.len()).sum();
+            let mut queue = VecDeque::new();
+            let mut queued_bytes = 0;
+            for (options, m) in x.queue {
+                queue_message(&self.conflate, &mut queue, &mut queued_bytes, options, m);
+            }
             self.by_client.insert(x.client_id.as_str().into(), sid);
             self.sessions.insert(
                 sid,
@@ -418,6 +423,24 @@ impl Contexts {
             self.restored.push(sid);
         }
     }
+}
+
+/// Appends a message to an offline session's queue. On a topic matching one of the `conflate`
+/// filters, a message replaces the one of the same topic already queued, if any, at its place:
+/// a device coming back gets the last value of each such topic, not their history.
+fn queue_message(conflate: &[Box<str>], queue: &mut VecDeque<(u8, Msg)>, bytes: &mut usize, options: u8, m: Msg) {
+    *bytes += m.packet.len();
+    if !conflate.is_empty() {
+        let topic = std::str::from_utf8(m.topic()).unwrap_or("");
+        if conflate.iter().any(|f| codec::matches(f, topic)) {
+            if let Some(q) = queue.iter_mut().rev().find(|q| q.1.topic() == m.topic()) {
+                *bytes -= q.1.packet.len();
+                *q = (options, m);
+                return;
+            }
+        }
+    }
+    queue.push_back((options, m));
 }
 
 impl Handler<DelayedWill> for Contexts {
@@ -575,8 +598,7 @@ impl Contexts {
                 );
             }
             _ if options & 3 > 0 && s.queued_bytes < self.max_queued => {
-                s.queued_bytes += m.packet.len();
-                s.undelivered.queue.push_back((options, m.clone()));
+                queue_message(&self.conflate, &mut s.undelivered.queue, &mut s.queued_bytes, options, m.clone());
             }
             _ => {} // QoS 0 messages are not kept for offline sessions
         }
@@ -2304,6 +2326,8 @@ pub struct Config {
     pub wal: Option<WalConfig>,
     /// See `stop`.
     pub drain: Arc<std::sync::atomic::AtomicBool>,
+    /// Topic filters whose messages queued for offline sessions keep only the last per topic.
+    pub conflate: Arc<[Box<str>]>,
 }
 
 impl Default for Config {
@@ -2328,6 +2352,7 @@ impl Default for Config {
             autosave: Duration::from_secs(30),
             wal: None,
             drain: Arc::default(),
+            conflate: Arc::new([]),
         }
     }
 }
@@ -2378,6 +2403,7 @@ pub fn start(config: &Config) -> std::io::Result<Engine> {
         // Added in this order on every core, so that their ids are known up front.
         let r = seq.add_actor(core, || Router { index: SubIndex::new() });
         let t = topology.clone();
+        let conflate = config.conflate.clone();
         let c = seq.add_actor(core, move || {
             let mut c = Contexts {
                 topology: t,
@@ -2390,6 +2416,7 @@ pub fn start(config: &Config) -> std::io::Result<Engine> {
                 restored: Vec::new(),
                 wills: HashMap::new(),
                 wal: wal_on,
+                conflate,
             };
             c.restore(saved);
             c

@@ -25,6 +25,21 @@ pub struct Msg {
     pub retained: bool,
 }
 
+impl Msg {
+    /// The topic, read from `packet`.
+    pub fn topic(&self) -> &[u8] {
+        let p = &self.packet;
+        let mut at = 1;
+        while at < p.len() && p[at] & 0x80 != 0 {
+            at += 1; // remaining length, variable-length
+        }
+        at += 1;
+        let Some(len) = p.get(at..at + 2) else { return &[] };
+        let len = u16::from_be_bytes([len[0], len[1]]) as usize;
+        p.get(at + 2..at + 2 + len).unwrap_or(&[])
+    }
+}
+
 #[derive(Default, Debug, PartialEq, Eq)]
 pub struct SavedRetained {
     pub topic: String,
@@ -267,6 +282,9 @@ mod tests {
                 received: vec![3, 4],
             }],
         };
+        let mut m = Msg::default();
+        crate::codec::publish(&mut m.packet, "a/b", &[1; 200], 0, false, None);
+        assert_eq!(m.topic(), b"a/b");
         let bytes = encode(&s);
         assert_eq!(decode(&bytes).unwrap(), s);
         assert!(decode(&bytes[..bytes.len() - 1]).is_err());

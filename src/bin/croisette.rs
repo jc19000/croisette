@@ -6,6 +6,7 @@
 //!        [--tls-cert PEM --tls-key PEM [--tls-port 8883] [--wss-port PORT]] [--ws-port PORT]
 //!        [--persist-dir DIR [--autosave SECONDS]] [--storage none|snapshot|wal]
 //!        [--fsync batch|interval:<ms>|never] [--durable-qos 1|2]
+//!        [--conflate FILTER]...
 //!        croisette hash-password USER PASSWORD     (prints a password file line)
 //!
 //! MODE: `spin`, `adaptive` (2000 idle loops, then 1 ms sleeps), `adaptive:<loops>:<µs>`,
@@ -34,6 +35,7 @@ fn main() {
     let mut mode = None;
     let (mut tls_cert, mut tls_key) = (None, None);
     let mut storage = None;
+    let mut conflate: Vec<Box<str>> = Vec::new();
     let mut wal = croisette::wal::WalConfig::default();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -78,6 +80,10 @@ fn main() {
                     _ => panic!("--fsync batch|interval:<ms>|never"),
                 }
             }
+            "--conflate" => {
+                assert!(croisette::codec::valid_filter(&value), "--conflate {value}: not a topic filter");
+                conflate.push(value.into());
+            }
             "--durable-qos" => wal.durable_qos = value.parse().expect("1 or 2"),
             "--acl" => acl = Some(PathBuf::from(value)),
             "--allow-anonymous" => anonymous = value.parse().expect("true or false"),
@@ -112,6 +118,7 @@ fn main() {
         }
         Some(other) => panic!("--storage none|snapshot|wal, not {other}"),
     }
+    config.conflate = conflate.into();
     croisette::net::block_termination_signals();
     let engine = broker::start(&config).expect("broker start");
     let mut extra = config.tls.as_ref().map(|_| format!(", TLS on port {}", config.tls_port)).unwrap_or_default();
