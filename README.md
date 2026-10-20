@@ -10,7 +10,7 @@ TLS. At loads both brokers
 handle, croisette uses 20 to 45 % less CPU and has lower tail latency. When idle, both use about
 0.001 core. Memory per idle connection is 1.0 KB, against 0.78 KB for Mosquitto.
 
-Status: MQTT 5 and 3.1.1, with TLS, WebSocket and snapshots on disk (see [Scope](#scope)). It has not been run in
+Status: MQTT 5 and 3.1.1, with TLS, WebSocket and durable storage (snapshots and a write-ahead log, see [Scope](#scope)). It has not been run in
 production.
 
 ```sh
@@ -130,24 +130,46 @@ Not implemented yet:
 TLS). The upgrade accepts the `mqtt` subprotocol. A packet may span binary frames, and a frame
 may hold several packets.
 
-**Persistence:** `--persist-dir DIR` saves the retained messages and the persistent sessions
-(subscriptions and undelivered QoS 1/2 messages):
+**Storage:** `--persist-dir DIR` keeps the retained messages and the persistent sessions
+(subscriptions and undelivered QoS 1/2 messages) on disk. `--storage` picks how:
 
-- every `--autosave` seconds (default 30), each core writes its partition with io_uring, to a new
-  file renamed over the previous one;
-- again on SIGTERM or SIGINT, which stop the broker cleanly;
-- at start-up, the snapshots are read and their entries spread over the current cores, whose
-  number may have changed.
+| `--storage` | What is on disk | Lost on a crash |
+|---|---|---|
+| `none` | nothing (`--persist-dir` ignored) | everything |
+| `snapshot` (default with `--persist-dir`) | snapshots every `--autosave` seconds | what came after the last snapshot (Mosquitto's `autosave_interval` model) |
+| `wal` | snapshots + a write-ahead log | nothing that was acknowledged |
 
-Messages received after the last snapshot are lost on a crash, and nothing is fsynced. This is
-Mosquitto's model (autosave_interval).
+Snapshots: every `--autosave` seconds (default 30), each core writes its partition with
+io_uring, to a new file renamed over the previous one; again on SIGTERM or SIGINT, which stop
+the broker cleanly. At start-up the snapshots are read and their entries spread over the current
+cores, whose number may have changed.
+
+Write-ahead log (`--storage wal`): each core appends to its own segment the QoS 1/2 messages it
+receives, the changes of retained messages and of persistent sessions. The records of one loop
+iteration go out as one io_uring write, and the PUBACK / PUBREC of the messages they hold are
+sent when that write completes: one disk flush for many messages (group commit). Each snapshot
+is a checkpoint: the cores start new segments and drop the ones it covers. At start-up the
+segments are replayed on top of the snapshots (a message may then be delivered twice, never
+lost). Records carry a CRC; a torn last record is ignored.
+
+- `--fsync batch` (default): the log is opened O_DSYNC, so an acknowledged message survives a
+  power cut.
+- `--fsync interval:<ms>`: a thread flushes the log every period; an acknowledged message
+  survives a broker crash, and a power cut loses up to one period.
+- `--fsync never`: the kernel writes back when it wants; an acknowledged message survives a
+  broker crash.
+- `--durable-qos 2`: log only QoS 2 messages (default 1: QoS 1 and 2).
+
+On the test VM a synchronous 4 KB write takes about 400 µs, yet QoS 1 at 200 000 msg/s (10
+publishers, one core) runs as fast with `--storage wal --fsync batch` as with snapshots only
+(4.7 CPU-seconds per million messages both), since each flush carries about 80 messages.
 
 **Not implemented:** bridges, clustering across machines.
 
 **Tests:**
 
-- `tests/broker.rs`: 35 end-to-end tests with real TCP, TLS and WebSocket clients, MQTT 5 and
-  3.1.1, on two cores, including a restart from snapshots.
+- `tests/broker.rs`: 36 end-to-end tests with real TCP, TLS and WebSocket clients, MQTT 5 and
+  3.1.1, on two cores, including a restart from snapshots and a kill -9 with the write-ahead log.
 - Unit tests for the codec, the index and authentication.
 - `tests/interop.sh`: 20 checks with `mosquitto_pub` / `mosquitto_sub`, MQTT 5, TLS and restart
   included.
@@ -159,7 +181,8 @@ croisette [--port 1883] [--cores 1,2] [--mode MODE] [--max-queued BYTES] [--max-
           [--max-inflight N] [--connect-timeout S] [--sys-interval S]
           [--passwd FILE] [--acl FILE] [--allow-anonymous true|false]
           [--tls-cert PEM --tls-key PEM [--tls-port 8883] [--wss-port P]] [--ws-port P]
-          [--persist-dir DIR [--autosave S]]
+          [--persist-dir DIR [--autosave S] [--storage none|snapshot|wal]
+           [--fsync batch|interval:<ms>|never] [--durable-qos 1|2]]
 croisette hash-password USER PASSWORD
 ```
 

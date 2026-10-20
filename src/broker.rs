@@ -32,6 +32,7 @@ use crate::index::{Entry, Sub, SubIndex};
 use crate::net;
 use crate::persist::{self, Msg, Saved, SavedRetained, SavedSession};
 use crate::tls::{ServerConfig, Tls};
+use crate::wal::{self, Fsync, Record, WalConfig};
 use crate::ws::Ws;
 
 const ROUTER: u32 = 0;
@@ -54,6 +55,9 @@ fn fnv(s: &str) -> u64 {
 /// The broker's cores, shared by every actor.
 struct Topology {
     cores: Vec<CoreId>,
+    /// Set by `stop`: the connection tier closes its connections, so that sessions are handed to
+    /// the context tier before the snapshots.
+    drain: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Topology {
@@ -192,6 +196,11 @@ struct Undelivered {
     received: Vec<u16>,
 }
 
+/// context -> connection tier of the same core: records for the core's write-ahead log.
+struct WalAppend {
+    bytes: Vec<u8>,
+}
+
 /// connection -> context: the subscriptions of an online persistent session changed (kept for
 /// snapshots).
 struct SessionFilters {
@@ -276,6 +285,8 @@ pub struct Contexts {
     restored: Vec<u32>,
     /// Delayed wills by client id, with their due time.
     wills: HashMap<Box<str>, (u64, Box<OwnedWill>)>,
+    /// Session ends go to the write-ahead log.
+    wal: bool,
 }
 
 /// A client id's session, on the context partition of the client id.
@@ -489,6 +500,11 @@ impl Contexts {
     fn discard(&mut self, ctx: &mut Context, sid: u32) {
         let Some(s) = self.sessions.remove(&sid) else { return };
         self.by_client.remove(&s.client_id);
+        if self.wal && s.persistent {
+            let mut bytes = Vec::new();
+            wal::append(&mut bytes, &Record::SessionEnd { client_id: s.client_id.to_string() });
+            ctx.send(actor(ctx.core(), CONNECTIONS), WalAppend { bytes });
+        }
         if matches!(s.state, SessionState::Offline) {
             let target = (ctx.core() as u16, SESSION | sid as u64);
             for (filter, _) in &s.filters {
@@ -651,6 +667,90 @@ const ACCEPT_TLS: u64 = 5;
 const SAVE: u64 = 6;
 const ACCEPT_WS: u64 = 7;
 const ACCEPT_WSS: u64 = 8;
+const WAL: u64 = 9;
+
+/// The write-ahead log of a core (see `wal`).
+struct WalWriter {
+    config: WalConfig,
+    dir: PathBuf,
+    core: usize,
+    seq: u64,
+    fd: RawFd,
+    offset: u64,
+    /// Records of this iteration, and the acknowledgements that wait for them (batch mode).
+    buf: Vec<u8>,
+    acks_waiting: Vec<(u64, Vec<u8>)>,
+    /// The write in flight (its length) and the acknowledgements it releases.
+    writing: Option<usize>,
+    acks_in_flight: Vec<(u64, Vec<u8>)>,
+    /// A checkpoint came while a write was in flight: start a new segment after it.
+    rotate: bool,
+    /// For `Fsync::Interval`: the segment the flushing thread syncs.
+    syncer: Option<Arc<std::sync::Mutex<Option<std::fs::File>>>>,
+}
+
+impl WalWriter {
+    fn open(config: WalConfig, dir: PathBuf, core: usize, seq: u64) -> std::io::Result<WalWriter> {
+        let mut w = WalWriter {
+            config,
+            dir,
+            core,
+            seq,
+            fd: -1,
+            offset: 0,
+            buf: Vec::new(),
+            acks_waiting: Vec::new(),
+            writing: None,
+            acks_in_flight: Vec::new(),
+            rotate: false,
+            syncer: None,
+        };
+        if let Fsync::Interval(period) = config.fsync {
+            let slot: Arc<std::sync::Mutex<Option<std::fs::File>>> = Arc::default();
+            let s = slot.clone();
+            std::thread::Builder::new().name("croisette-wal-sync".into()).spawn(move || loop {
+                std::thread::sleep(period);
+                if let Some(f) = s.lock().unwrap().as_ref() {
+                    let _ = f.sync_data();
+                }
+            })?;
+            w.syncer = Some(slot);
+        }
+        w.open_segment()?;
+        Ok(w)
+    }
+
+    fn open_segment(&mut self) -> std::io::Result<()> {
+        use std::os::unix::fs::OpenOptionsExt;
+        const O_DSYNC: i32 = 0o10000;
+        let flags = if self.config.fsync == Fsync::Batch { O_DSYNC } else { 0 };
+        let path = wal::segment_path(&self.dir, self.core, self.seq);
+        let f = std::fs::OpenOptions::new().create(true).write(true).truncate(true).custom_flags(flags).open(path)?;
+        if let Some(slot) = &self.syncer {
+            *slot.lock().unwrap() = Some(f.try_clone()?);
+        }
+        self.fd = f.into_raw_fd();
+        self.offset = 0;
+        Ok(())
+    }
+
+    /// Checkpoint: a new segment; the ones before the previous checkpoint are covered by the
+    /// snapshots and go.
+    fn rotate(&mut self) {
+        drop(unsafe { std::fs::File::from_raw_fd(self.fd) });
+        self.seq += 1;
+        if let Err(e) = self.open_segment() {
+            eprintln!("croisette: cannot open a WAL segment: {e}");
+        }
+        if let Ok(segments) = wal::segments(&self.dir) {
+            for (seq, core, path) in segments {
+                if core == self.core && seq + 2 <= self.seq {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
+    }
+}
 
 /// Period of the connection tier's sweep (keep-alive and CONNECT timeouts).
 const TICK: Duration = Duration::from_secs(1);
@@ -761,6 +861,8 @@ struct Conn {
     session: Option<u32>,
     /// Bytes received after CONNECT, held until the session is opened.
     held: Option<Vec<u8>>,
+    /// A Session record of it is in the write-ahead log (its end must be logged too).
+    logged_session: bool,
     /// Access rules, when the broker has an ACL.
     rules: Option<Box<[Rule]>>,
     /// Layers under MQTT, for connections accepted on the TLS, WebSocket or secure WebSocket
@@ -813,6 +915,11 @@ pub struct Connections {
     /// By core: `Deliver` bytes received from it, acknowledged at the end of the iteration.
     consumed_from: Vec<usize>,
     max_core_backlog: usize,
+    /// The core's write-ahead log, with `--storage wal`: configuration, first segment, writer.
+    wal_config: Option<WalConfig>,
+    wal_seq: u64,
+    wal: Option<Box<WalWriter>>,
+    drained: bool,
     /// Snapshot directory and period in ticks, and the snapshot file being written.
     persist: Option<PathBuf>,
     autosave: u32,
@@ -897,6 +1004,7 @@ impl Connections {
             session: None,
             held: None,
             rules: None,
+            logged_session: false,
             tls,
             ws,
             out: Vec::new(),
@@ -908,6 +1016,80 @@ impl Connections {
         self.open += 1;
         let id = self.id(index);
         ctx.io().unwrap().recv(fd, Vec::with_capacity(RECV_MIN), token(RECV, id));
+    }
+
+    /// Arms the end-of-iteration callback (flushes connections and the log).
+    fn arm(&mut self, ctx: &mut Context) {
+        if !self.callback_armed {
+            self.callback_armed = true;
+            ctx.register_callback();
+        }
+    }
+
+    /// Appends a record to the core's write-ahead log, if any.
+    fn log(&mut self, ctx: &mut Context, record: &Record) {
+        if let Some(w) = self.wal.as_mut() {
+            wal::append(&mut w.buf, record);
+            self.arm(ctx);
+        }
+    }
+
+    /// Sends an acknowledgement to connection `id`; with `durable`, once the log write holding
+    /// its message is on disk.
+    fn send_ack(&mut self, ctx: &mut Context, id: u64, ack: Vec<u8>, durable: bool) {
+        if durable {
+            if let Some(w) = self.wal.as_mut() {
+                w.acks_waiting.push((id, ack));
+                self.arm(ctx);
+                return;
+            }
+        }
+        if let Some(c) = self.get(id) {
+            c.out.extend_from_slice(&ack);
+            self.mark_dirty(ctx, id);
+        }
+    }
+
+    /// End of iteration: the records of the iteration go out in one write (if none is in
+    /// flight); acknowledgements with nothing left to wait for are sent.
+    fn flush_wal(&mut self, ctx: &mut Context) {
+        let Some(w) = self.wal.as_mut() else { return };
+        if w.writing.is_some() {
+            return;
+        }
+        if w.buf.is_empty() {
+            let acks = std::mem::take(&mut w.acks_waiting);
+            for (id, ack) in acks {
+                self.send_ack(ctx, id, ack, false);
+            }
+            return;
+        }
+        let data = std::mem::take(&mut w.buf);
+        w.writing = Some(data.len());
+        w.acks_in_flight = std::mem::take(&mut w.acks_waiting);
+        let (fd, offset) = (w.fd, w.offset);
+        ctx.io().unwrap().write(fd, data, offset, token(WAL, 0));
+    }
+
+    fn wal_written(&mut self, ctx: &mut Context, result: i32) {
+        let Some(w) = self.wal.as_mut() else { return };
+        let len = w.writing.take().unwrap_or(0);
+        if result < 0 || result as usize != len {
+            eprintln!("croisette: write-ahead log write failed ({result} of {len} bytes)");
+        }
+        w.offset += result.max(0) as u64;
+        if w.rotate {
+            w.rotate = false;
+            w.rotate();
+        }
+        let acks = std::mem::take(&mut w.acks_in_flight);
+        let more = !w.buf.is_empty() || !w.acks_waiting.is_empty();
+        for (id, ack) in acks {
+            self.send_ack(ctx, id, ack, false);
+        }
+        if more {
+            self.arm(ctx);
+        }
     }
 
     fn publish_will(&mut self, ctx: &mut Context, will: &OwnedWill) {
@@ -922,6 +1104,16 @@ impl Connections {
                 expires,
             };
             ctx.send(actor(partition, CONTEXT), retain);
+            self.log(
+                ctx,
+                &Record::Retain(SavedRetained {
+                    topic: will.topic.to_string(),
+                    payload: will.payload.clone(),
+                    qos: will.qos,
+                    props: will.props.clone(),
+                    expires,
+                }),
+            );
         }
         self.publish(ctx, &will.topic, &will.payload, will.qos, &will.props, expires, will.retain, None);
     }
@@ -976,6 +1168,22 @@ impl Connections {
                     ctx.send(actor(partition, CONTEXT), DelayedWill { client_id: client_id.clone(), will, due });
                 }
                 _ => self.publish_will(ctx, &will),
+            }
+        }
+        if let (true, Some(client_id)) = (self.wal.is_some(), &conn.client_id) {
+            let record = if conn.persistent && conn.session.is_some() {
+                Some(Record::Session {
+                    client_id: client_id.to_string(),
+                    expiry: conn.session_expiry,
+                    filters: conn.filters.iter().map(|(f, o)| (f.to_string(), *o)).collect(),
+                })
+            } else if conn.logged_session {
+                Some(Record::SessionEnd { client_id: client_id.to_string() })
+            } else {
+                None
+            };
+            if let Some(r) = record {
+                self.log(ctx, &r);
             }
         }
         if let Some(client_id) = conn.client_id {
@@ -1154,11 +1362,21 @@ impl Connections {
         if self.persist.is_none() {
             return;
         }
+        let wal = self.wal.is_some();
         let Some(conn) = self.get(id) else { return };
         let (true, Some(_), Some(client_id)) = (conn.persistent, conn.session, &conn.client_id) else { return };
         let msg = SessionFilters { client_id: client_id.clone(), filters: conn.filters.clone() };
+        let record = wal.then(|| Record::Session {
+            client_id: client_id.to_string(),
+            expiry: conn.session_expiry,
+            filters: conn.filters.iter().map(|(f, o)| (f.to_string(), *o)).collect(),
+        });
+        conn.logged_session |= wal;
         let partition = self.topology.partition(&msg.client_id);
         ctx.send(actor(partition, CONTEXT), msg);
+        if let Some(r) = record {
+            self.log(ctx, &r);
+        }
     }
 
     /// Closes connection `id` for a protocol reason: MQTT 5 clients first get a DISCONNECT with
@@ -1200,7 +1418,28 @@ impl Connections {
             self.publish_will(ctx, &will);
         }
         self.forwards.retain(|_, f| tick.wrapping_sub(f.2) <= 2);
+        if self.topology.drain.load(std::sync::atomic::Ordering::Relaxed) && !self.drained {
+            // Stopping: every connection closes now, handing its session to the context tier.
+            self.drained = true;
+            let ids: Vec<u64> = (0..self.conns.len() as u32)
+                .filter(|&i| self.conns[i as usize].is_some())
+                .map(|i| self.id(i))
+                .collect();
+            for id in ids {
+                if let Some(c) = self.get(id) {
+                    c.will = None; // broker shutdown, not a client failure
+                }
+                self.close(ctx, id);
+            }
+        }
         if self.autosave > 0 && tick % self.autosave == 0 && self.saving.is_none() {
+            if let Some(w) = self.wal.as_mut() {
+                if w.writing.is_some() {
+                    w.rotate = true;
+                } else {
+                    w.rotate();
+                }
+            }
             self.save(ctx);
         }
         if self.sys_interval > 0 && tick % self.sys_interval == 0 {
@@ -1228,6 +1467,8 @@ impl Connections {
         let core = self.core(ctx);
         let auth = if matches!(packet, Packet::Connect(_)) { self.auth.clone() } else { None };
         let max_inflight = self.max_inflight;
+        // Acknowledgements of messages of this QoS or more wait for their log write.
+        let durable_qos = self.wal.as_ref().map_or(3, |w| w.config.durable_qos);
         let conn = self.get(id).unwrap();
         if conn.connected == matches!(packet, Packet::Connect(_)) {
             return Next::Close; // anything before CONNECT, or a second CONNECT
@@ -1342,25 +1583,22 @@ impl Connections {
                 // routed.
                 let allowed = conn.rules.as_ref().is_none_or(|r| auth::can_write(r, topic));
                 let pid = packet_id.unwrap_or(0);
+                let mut again = false;
                 if qos == 2 {
                     // Routed once: a copy with the same id before PUBREL is a redelivery.
                     let ob = conn.outbound.get_or_insert_with(Default::default);
-                    let again = ob.received.contains(&pid);
+                    again = ob.received.contains(&pid);
                     if !again {
                         ob.received.push(pid);
                     }
-                    let code = if allowed || !v5 { reason::SUCCESS } else { reason::NOT_AUTHORIZED };
-                    codec::ack_v5(&mut conn.out, 0x50, pid, code);
-                    if again || !allowed {
-                        self.mark_dirty(ctx, id);
-                        return Next::Continue;
-                    }
                 }
-                if !allowed {
-                    if qos == 1 {
-                        let code = if v5 { reason::NOT_AUTHORIZED } else { reason::SUCCESS };
-                        codec::ack_v5(&mut conn.out, 0x40, pid, code);
-                        self.mark_dirty(ctx, id);
+                let ack_type = if qos == 1 { 0x40 } else { 0x50 };
+                if !allowed || again {
+                    if qos > 0 {
+                        let code = if allowed || !v5 { reason::SUCCESS } else { reason::NOT_AUTHORIZED };
+                        let mut ack = Vec::new();
+                        codec::ack_v5(&mut ack, ack_type, pid, code);
+                        self.send_ack(ctx, id, ack, qos >= durable_qos);
                     }
                     return Next::Continue;
                 }
@@ -1371,15 +1609,21 @@ impl Connections {
                     let r =
                         Retain { topic: topic.into(), payload: payload.to_vec(), qos, props: props.to_vec(), expires };
                     ctx.send(actor(partition, CONTEXT), r);
+                    let record = Record::Retain(SavedRetained {
+                        topic: topic.into(),
+                        payload: payload.to_vec(),
+                        qos,
+                        props: props.to_vec(),
+                        expires,
+                    });
+                    self.log(ctx, &record);
                 }
                 let n = self.publish(ctx, topic, payload, qos, &props, expires, retain, Some(id));
-                if qos == 2 {
-                    self.mark_dirty(ctx, id); // the PUBREC
-                }
-                if qos == 1 {
-                    let code = if v5 && n == 0 { reason::NO_MATCHING_SUBSCRIBERS } else { reason::SUCCESS };
-                    codec::ack_v5(&mut self.get(id).unwrap().out, 0x40, pid, code);
-                    self.mark_dirty(ctx, id);
+                if qos > 0 {
+                    let code = if v5 && qos == 1 && n == 0 { reason::NO_MATCHING_SUBSCRIBERS } else { reason::SUCCESS };
+                    let mut ack = Vec::new();
+                    codec::ack_v5(&mut ack, ack_type, pid, code);
+                    self.send_ack(ctx, id, ack, qos >= durable_qos);
                 }
             }
             Packet::Subscribe { packet_id, filters } => {
@@ -1530,6 +1774,15 @@ impl Connections {
         packet.clear();
         codec::publish(&mut packet, topic, payload, 0, false, None);
         let msg = Msg { packet, props: props.to_vec(), expires, retained };
+        if let Some(w) = self.wal.as_mut() {
+            if qos >= w.config.durable_qos {
+                wal::append_publish(&mut w.buf, topic, qos, &msg.packet, props, expires, retained);
+                if !self.callback_armed {
+                    self.callback_armed = true;
+                    ctx.register_callback();
+                }
+            }
+        }
         let mut i = 0;
         while i < targets.len() {
             let core = targets[i].0 .0;
@@ -1752,6 +2005,13 @@ impl Actor for Connections {
         self.router = Some(ctx.reference_local_actor::<Router>(router).expect("router on this core"));
         let contexts = actor(ctx.core(), CONTEXT);
         self.contexts = Some(ctx.reference_local_actor::<Contexts>(contexts).expect("contexts on this core"));
+        ctx.register_handler::<WalAppend, Self>();
+        if let (Some(config), Some(dir)) = (self.wal_config, &self.persist) {
+            match WalWriter::open(config, dir.clone(), ctx.core(), self.wal_seq) {
+                Ok(w) => self.wal = Some(Box::new(w)),
+                Err(e) => panic!("croisette: cannot open the write-ahead log in {}: {e}", dir.display()),
+            }
+        }
         let mut io = ctx.io().expect("io_uring on broker cores");
         for &(kind, fd) in &self.listeners {
             io.accept(fd, token(kind, 0));
@@ -1785,6 +2045,7 @@ impl Actor for Connections {
         for id in closing {
             self.close(ctx, id);
         }
+        self.flush_wal(ctx);
         for c in 0..self.consumed_from.len() {
             let bytes = std::mem::take(&mut self.consumed_from[c]);
             if bytes > 0 {
@@ -1818,6 +2079,7 @@ impl Handler<IoCompletion> for Connections {
                 let Some(&(_, fd)) = self.listeners.iter().find(|l| l.0 == kind) else { return };
                 ctx.io().unwrap().accept(fd, token(kind, 0));
             }
+            WAL => self.wal_written(ctx, c.result),
             SAVE => {
                 let len = c.take_buf().map_or(0, |b| b.len());
                 self.saved(ctx, c.result, len);
@@ -1935,7 +2197,17 @@ impl Handler<Opened> for Connections {
             }
         }
         self.mark_dirty(ctx, o.conn);
+        self.sync_session_filters(ctx, o.conn);
         self.resume(ctx, o.conn, held);
+    }
+}
+
+impl Handler<WalAppend> for Connections {
+    fn on_event(&mut self, ctx: &mut Context, _src: ActorId, a: &WalAppend) {
+        if let Some(w) = self.wal.as_mut() {
+            w.buf.extend_from_slice(&a.bytes);
+            self.arm(ctx);
+        }
     }
 }
 
@@ -2028,6 +2300,10 @@ pub struct Config {
     /// and the period of the snapshots (also written at shutdown).
     pub persist_dir: Option<PathBuf>,
     pub autosave: Duration,
+    /// Write-ahead log on top of the snapshots (needs `persist_dir`).
+    pub wal: Option<WalConfig>,
+    /// See `stop`.
+    pub drain: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Default for Config {
@@ -2050,6 +2326,8 @@ impl Default for Config {
             wss_port: None,
             persist_dir: None,
             autosave: Duration::from_secs(30),
+            wal: None,
+            drain: Arc::default(),
         }
     }
 }
@@ -2057,8 +2335,18 @@ impl Default for Config {
 /// Starts the broker: on every core, a router replica, a context partition and the connection
 /// tier with its own SO_REUSEPORT listener and io_uring.
 pub fn start(config: &Config) -> std::io::Result<Engine> {
-    let topology = Arc::new(Topology { cores: config.cores.clone() });
-    let mut restored = restore(config, &topology)?;
+    if config.wal.is_some() && config.persist_dir.is_none() {
+        return Err(std::io::Error::other("the write-ahead log needs a persistence directory"));
+    }
+    // The listeners of a broker that just died on these ports must be gone first.
+    let ports = [Some(config.port), config.tls.as_ref().map(|_| config.tls_port), config.ws_port, config.wss_port];
+    for port in ports.into_iter().flatten() {
+        net::wait_port_free(config.ip, port, Duration::from_secs(10))?;
+    }
+    let topology = Arc::new(Topology { cores: config.cores.clone(), drain: config.drain.clone() });
+    let (mut restored, wal_seq) = restore(config, &topology)?;
+    let wal_config = config.wal;
+    let wal_on = config.wal.is_some();
     let mut seq = StartSequence::new();
     for &core in &config.cores {
         let saved = std::mem::take(&mut restored[topology.cores.iter().position(|&c| c == core).unwrap()]);
@@ -2101,6 +2389,7 @@ pub fn start(config: &Config) -> std::io::Result<Engine> {
                 persist: persist_dir,
                 restored: Vec::new(),
                 wills: HashMap::new(),
+                wal: wal_on,
             };
             c.restore(saved);
             c
@@ -2132,6 +2421,10 @@ pub fn start(config: &Config) -> std::io::Result<Engine> {
             consumed_from: Vec::new(),
             max_core_backlog,
             persist: persist_dir2,
+            wal: None,
+            wal_config,
+            wal_seq,
+            drained: false,
             autosave,
             saving: None,
             conns: Vec::new(),
@@ -2151,10 +2444,20 @@ pub fn start(config: &Config) -> std::io::Result<Engine> {
 /// Reads the snapshots of `persist_dir`, and splits their entries over the partitions of the
 /// current cores (by index in `topology.cores`). The split is written back at once and older
 /// files are removed, so that a change in the number of cores is picked up whole.
-fn restore(config: &Config, topology: &Topology) -> std::io::Result<Vec<Saved>> {
+fn restore(config: &Config, topology: &Topology) -> std::io::Result<(Vec<Saved>, u64)> {
     let mut parts: Vec<Saved> = topology.cores.iter().map(|_| Saved::default()).collect();
-    let Some(dir) = &config.persist_dir else { return Ok(parts) };
-    let (saved, paths) = persist::load_dir(dir)?;
+    let Some(dir) = &config.persist_dir else { return Ok((parts, 0)) };
+    let (mut saved, paths) = persist::load_dir(dir)?;
+    // Write-ahead log segments left by a crash: their records on top of the snapshots.
+    let segments = wal::segments(dir)?;
+    let next_seq = segments.iter().map(|s| s.0 + 1).max().unwrap_or(0);
+    // One replay over every segment: a session record may sit in another core's segment than
+    // the messages queued for it.
+    let mut records = Vec::new();
+    for (_, _, path) in &segments {
+        records.extend(wal::read(&std::fs::read(path)?));
+    }
+    wal::replay(&mut saved, records);
     let index = |key: &str| topology.cores.iter().position(|&c| c == topology.partition(key)).unwrap();
     for r in saved.retained {
         parts[index(&r.topic)].retained.push(r);
@@ -2171,7 +2474,23 @@ fn restore(config: &Config, topology: &Topology) -> std::io::Result<Vec<Saved>> 
     for p in paths.iter().filter(|p| !written.contains(p)) {
         std::fs::remove_file(p)?;
     }
-    Ok(parts)
+    for (_, _, path) in &segments {
+        std::fs::remove_file(path)?; // replayed into the snapshots just written
+    }
+    Ok((parts, next_seq))
+}
+
+/// Stops the broker cleanly: connections close (sessions go to the context tier), then the
+/// engine stops and the snapshots are written; the write-ahead log is then covered by them.
+pub fn stop(engine: Engine, config: &Config) {
+    config.drain.store(true, std::sync::atomic::Ordering::Relaxed);
+    std::thread::sleep(TICK + Duration::from_millis(500));
+    engine.shutdown();
+    if let (Some(_), Some(dir)) = (config.wal, &config.persist_dir) {
+        for (_, _, path) in wal::segments(dir).unwrap_or_default() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 /// The idle mode for several cores: spin while traffic flows, then after 2000 idle iterations

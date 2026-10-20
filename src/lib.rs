@@ -8,4 +8,5 @@ pub mod index;
 pub mod net;
 pub mod persist;
 pub mod tls;
+pub mod wal;
 pub mod ws;

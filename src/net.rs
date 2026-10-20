@@ -138,3 +138,30 @@ pub fn wait_for_termination() -> i32 {
     unsafe { sigwait(&set, &mut sig) };
     sig
 }
+
+/// Waits until no socket listens on `ip:port` any more, for at most `timeout`.
+///
+/// After a crash, the listening sockets of the dead process can outlive it for a moment while
+/// the kernel tears down its io_uring (pending accepts hold them). They are still in the
+/// SO_REUSEPORT group then, and would take a share of the new connections that nobody accepts.
+/// A bind without SO_REUSEPORT fails while any of them listens: once it succeeds, they are gone.
+/// Err: the port is still taken (another broker runs there).
+pub fn wait_port_free(ip: Ipv4Addr, port: u16, timeout: Duration) -> io::Result<()> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let fd = check(unsafe { socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0) })?;
+        let bound = set_int(fd, SOL_SOCKET, SO_REUSEADDR, 1).and_then(|_| {
+            let addr =
+                SockAddrIn { family: AF_INET as u16, port: port.to_be(), addr: u32::from(ip).to_be(), zero: [0; 8] };
+            check(unsafe { bind(fd, &addr, std::mem::size_of::<SockAddrIn>() as u32) }).map(|_| ())
+        });
+        unsafe { close(fd) };
+        match bound {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::AddrInUse && std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => return Err(io::Error::new(e.kind(), format!("port {port}: {e}"))),
+        }
+    }
+}

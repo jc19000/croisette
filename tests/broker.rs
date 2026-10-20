@@ -20,12 +20,19 @@ fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
 }
 
+/// Distinct free ports (successive `free_port` calls may return the same one).
+fn free_ports<const N: usize>() -> [u16; N] {
+    let listeners: Vec<TcpListener> = (0..N).map(|_| TcpListener::bind("127.0.0.1:0").unwrap()).collect();
+    std::array::from_fn(|i| listeners[i].local_addr().unwrap().port())
+}
+
 fn start(cores: Vec<usize>) -> (cannes::Engine, SocketAddr) {
     start_with(Config { cores, ..Config::default() })
 }
 
 fn start_with(config: Config) -> (cannes::Engine, SocketAddr) {
-    let port = free_port();
+    let taken = [Some(config.tls_port), config.ws_port, config.wss_port];
+    let port = std::iter::repeat_with(free_port).find(|p| !taken.contains(&Some(*p))).unwrap();
     let config = Config {
         ip: Ipv4Addr::LOCALHOST,
         port,
@@ -1085,11 +1092,11 @@ fn websocket_and_secure_websocket_clients() {
     let _g = serial();
     let tls = croisette::tls::server_config_from_pem(include_bytes!("data/cert.pem"), include_bytes!("data/key.pem"))
         .unwrap();
-    let (ws_port, wss_port) = (free_port(), free_port());
+    let [ws_port, wss_port, tls_port] = free_ports();
     let config = Config {
         cores: vec![1, 2],
         tls: Some(tls),
-        tls_port: free_port(),
+        tls_port,
         ws_port: Some(ws_port),
         wss_port: Some(wss_port),
         ..Config::default()
@@ -1353,4 +1360,89 @@ fn mqtt5_will_delay() {
     watcher.set_timeout(Some(Duration::from_millis(4500))).unwrap();
     assert!(watcher.next_publish().is_err(), "no will after a reconnection");
     engine.shutdown();
+}
+
+// ---- Write-ahead log: crash recovery ------------------------------------------------------------
+
+/// The broker binary in its own process, killed with SIGKILL like a crash.
+struct BrokerProcess(std::process::Child);
+
+impl BrokerProcess {
+    fn start(port: u16, dir: &std::path::Path, extra: &[&str]) -> BrokerProcess {
+        let mut args = vec![
+            "--port".to_string(),
+            port.to_string(),
+            "--cores".into(),
+            "1,2".into(),
+            "--persist-dir".into(),
+            dir.display().to_string(),
+            "--autosave".into(),
+            "3600".into(), // no checkpoint during the test: everything comes from the log
+        ];
+        args.extend(extra.iter().map(|s| s.to_string()));
+        let child = std::process::Command::new(env!("CARGO_BIN_EXE_croisette"))
+            .args(&args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        // Ready once it answers MQTT (a bare TCP connect could reach the listening sockets of the
+        // process just killed, which the kernel releases a few milliseconds later).
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+        for _ in 0..200 {
+            let probe = TcpStream::connect(addr).and_then(|_| Client::connect(addr, "probe"));
+            if let Ok(c) = probe {
+                c.disconnect().unwrap();
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        BrokerProcess(child)
+    }
+
+    fn crash(self) {} // see Drop
+}
+
+impl Drop for BrokerProcess {
+    fn drop(&mut self) {
+        let _ = self.0.kill(); // SIGKILL
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn acknowledged_messages_survive_a_crash() {
+    let _g = serial();
+    for fsync in ["batch", "never"] {
+        let dir = std::env::temp_dir().join(format!("croisette-wal-{}-{fsync}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let port = free_port();
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+        let broker = BrokerProcess::start(port, &dir, &["--storage", "wal", "--fsync", fsync]);
+        let (mut dev, _) = persistent(addr, "dev");
+        dev.subscribe_qos(&["w/#"], 1).unwrap();
+        dev.disconnect().unwrap();
+        let mut p = client(addr, "p");
+        p.publish("cfg", b"retained", 1, true).unwrap();
+        for i in 0..200u32 {
+            p.publish("w/x", &i.to_be_bytes(), 1, false).unwrap(); // PUBACK: the message is logged
+        }
+        broker.crash();
+
+        let broker = BrokerProcess::start(port, &dir, &["--storage", "wal", "--fsync", fsync]);
+        let (mut dev, present) = persistent(addr, "dev");
+        assert!(present, "{fsync}: the session survived");
+        for i in 0..200u32 {
+            let got = dev.next_publish().unwrap_or_else(|e| panic!("{fsync}: message {i}: {e}"));
+            assert_eq!(got, qos1_msg("w/x", &i.to_be_bytes(), false), "{fsync}");
+        }
+        let mut s = client(addr, "s");
+        s.subscribe(&["cfg"]).unwrap();
+        assert_eq!(
+            s.next_publish().unwrap(),
+            Incoming::Publish { topic: "cfg".into(), payload: b"retained".to_vec(), qos: 0, retain: true }
+        );
+        broker.crash();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

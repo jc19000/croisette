@@ -4,7 +4,8 @@
 //!        [--max-packet BYTES] [--max-inflight MESSAGES] [--connect-timeout SECONDS]
 //!        [--sys-interval SECONDS] [--passwd FILE] [--acl FILE] [--allow-anonymous true|false]
 //!        [--tls-cert PEM --tls-key PEM [--tls-port 8883] [--wss-port PORT]] [--ws-port PORT]
-//!        [--persist-dir DIR [--autosave SECONDS]]
+//!        [--persist-dir DIR [--autosave SECONDS]] [--storage none|snapshot|wal]
+//!        [--fsync batch|interval:<ms>|never] [--durable-qos 1|2]
 //!        croisette hash-password USER PASSWORD     (prints a password file line)
 //!
 //! MODE: `spin`, `adaptive` (2000 idle loops, then 1 ms sleeps), `adaptive:<loops>:<µs>`,
@@ -32,6 +33,8 @@ fn main() {
     let (mut passwd, mut acl, mut anonymous) = (None, None, true);
     let mut mode = None;
     let (mut tls_cert, mut tls_key) = (None, None);
+    let mut storage = None;
+    let mut wal = croisette::wal::WalConfig::default();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         let value = args.next().unwrap_or_else(|| panic!("{arg} needs a value"));
@@ -64,6 +67,18 @@ fn main() {
             "--wss-port" => config.wss_port = Some(value.parse().expect("port")),
             "--persist-dir" => config.persist_dir = Some(PathBuf::from(value)),
             "--autosave" => config.autosave = Duration::from_secs(value.parse().expect("seconds")),
+            "--storage" => storage = Some(value),
+            "--fsync" => {
+                wal.fsync = match value.split_once(':') {
+                    None if value == "batch" => croisette::wal::Fsync::Batch,
+                    None if value == "never" => croisette::wal::Fsync::Never,
+                    Some(("interval", ms)) => {
+                        croisette::wal::Fsync::Interval(Duration::from_millis(ms.parse().expect("ms")))
+                    }
+                    _ => panic!("--fsync batch|interval:<ms>|never"),
+                }
+            }
+            "--durable-qos" => wal.durable_qos = value.parse().expect("1 or 2"),
             "--acl" => acl = Some(PathBuf::from(value)),
             "--allow-anonymous" => anonymous = value.parse().expect("true or false"),
             other => panic!("unknown option {other}"),
@@ -87,6 +102,16 @@ fn main() {
         (None, None) => {}
         _ => panic!("--tls-cert and --tls-key go together"),
     }
+    // Storage: none (memory), snapshot (--persist-dir alone), or wal (snapshots + log).
+    match storage.as_deref() {
+        None | Some("snapshot") => {}
+        Some("none") => config.persist_dir = None,
+        Some("wal") => {
+            assert!(config.persist_dir.is_some(), "--storage wal needs --persist-dir");
+            config.wal = Some(wal);
+        }
+        Some(other) => panic!("--storage none|snapshot|wal, not {other}"),
+    }
     croisette::net::block_termination_signals();
     let engine = broker::start(&config).expect("broker start");
     let mut extra = config.tls.as_ref().map(|_| format!(", TLS on port {}", config.tls_port)).unwrap_or_default();
@@ -99,5 +124,5 @@ fn main() {
     eprintln!("croisette listening on port {}{extra} on cores {:?} ({:?})", config.port, config.cores, config.mode);
     let sig = croisette::net::wait_for_termination();
     eprintln!("croisette: signal {sig}, stopping");
-    engine.shutdown(); // closes the connections and writes the snapshots
+    broker::stop(engine, &config); // closes the connections, writes the snapshots
 }

@@ -13,7 +13,12 @@ check() { # name, expected, actual
 }
 start() {
   ./target/release/croisette --port $PORT --cores 1,2 --sys-interval 1 "$@" 2>/dev/null & BROKER=$!
-  sleep 0.5
+  # Ready once it answers MQTT (or refuses: anonymous clients may be refused), at most 2 s.
+  for _ in $(seq 40); do
+    out=$(mosquitto_pub -p $PORT -t ready -n 2>&1) && break
+    [[ $out == *"not authori"* ]] && break
+    sleep 0.05
+  done
 }
 stop() { kill $BROKER; wait $BROKER 2>/dev/null; }
 sub() { mosquitto_sub -p $PORT "$@" 2>&1; }
