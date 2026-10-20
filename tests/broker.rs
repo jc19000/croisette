@@ -659,11 +659,9 @@ fn no_message_lost_across_reconnections(qos: u8) {
     }
     publisher.join().unwrap();
     assert_eq!(reconnects, 20);
-    // QoS 1 publishers pipeline, so some reconnections find unacknowledged messages; QoS 2
-    // ones go one message at a time and may not.
-    if qos == 1 {
-        assert!(redelivered > 0, "reconnections happened with unacknowledged messages");
-    }
+    // Whether a reconnection found unacknowledged messages depends on timing (the redelivery
+    // itself is tested by unacknowledged_messages_are_redelivered_with_dup).
+    eprintln!("QoS {qos}: {reconnects} reconnections, {redelivered} redeliveries");
     engine.shutdown();
 }
 
