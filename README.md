@@ -160,14 +160,14 @@ lost). Records carry a CRC; a torn last record is ignored.
   broker crash.
 - `--durable-qos 2`: log only QoS 2 messages (default 1: QoS 1 and 2).
 
+On the test VM a synchronous 4 KB write takes about 400 µs, yet QoS 1 at 200 000 msg/s (10
+publishers, one core) runs as fast with `--storage wal --fsync batch` as with snapshots only
+(4.7 CPU-seconds per million messages both), since each flush carries about 80 messages.
+
 **Conflation:** `--conflate FILTER` (repeatable) bounds the queues of offline sessions for
 state-like topics (telemetry, device shadows): a message on a matching topic replaces the one of
 the same topic already queued, at its place. A device back after a day gets the last value of
 each such topic, not 86 400 of them; commands on other topics keep their full history.
-
-On the test VM a synchronous 4 KB write takes about 400 µs, yet QoS 1 at 200 000 msg/s (10
-publishers, one core) runs as fast with `--storage wal --fsync batch` as with snapshots only
-(4.7 CPU-seconds per million messages both), since each flush carries about 80 messages.
 
 **Not implemented:** bridges, clustering across machines.
 
