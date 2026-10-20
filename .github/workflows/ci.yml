@@ -21,3 +21,13 @@ jobs:
       - run: cargo test --release
       - run: sudo apt-get update && sudo apt-get install -y mosquitto-clients
       - run: tests/interop.sh
+
+  iceberg:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo clippy --all-targets --features iceberg
+      - run: cargo test --features iceberg --test archive --lib

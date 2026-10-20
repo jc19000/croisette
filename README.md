@@ -10,7 +10,7 @@ TLS. At loads both brokers
 handle, croisette uses 20 to 45 % less CPU and has lower tail latency. When idle, both use about
 0.001 core. Memory per idle connection is 1.0 KB, against 0.78 KB for Mosquitto.
 
-Status: MQTT 5 and 3.1.1, with TLS, WebSocket and durable storage (snapshots and a write-ahead log, see [Scope](#scope)). It has not been run in
+Status: MQTT 5 and 3.1.1, with TLS, WebSocket, durable storage (snapshots and a write-ahead log) and an Iceberg archive (see [Scope](#scope)). It has not been run in
 production.
 
 ```sh
@@ -169,6 +169,40 @@ state-like topics (telemetry, device shadows): a message on a matching topic rep
 the same topic already queued, at its place. A device back after a day gets the last value of
 each such topic, not 86 400 of them; commands on other topics keep their full history.
 
+**Archive (Iceberg):** `--archive FILTER` (repeatable) appends every message published on a
+matching topic to an [Apache Iceberg](https://iceberg.apache.org/) table, for history,
+analytics and replay with Spark, Trino, DuckDB, Athena or pyiceberg:
+
+```sh
+cargo build --release --features iceberg
+croisette --archive 'sensors/#' --archive-catalog sqlite:/var/lib/croisette/catalog.db \
+          --archive-warehouse file:///var/lib/croisette/warehouse
+```
+
+- Catalog: `sqlite:PATH` (SQL catalog) or `http(s)://...` (REST catalog: Polaris, Nessie,
+  Lakekeeper, Glue or S3 Tables REST endpoints). Warehouse: `file:///DIR` or `s3://BUCKET/PATH`.
+  `--archive-prop KEY=VALUE` passes catalog and storage properties (`s3.endpoint`,
+  `s3.region`, `credential`...). The table (`--archive-table`, default `mqtt.messages`) is
+  created if missing.
+- Schema: `ts` (timestamptz, reception time), `topic`, `payload` (binary), `qos`, `retain`,
+  `client_id` (publisher), partitioned by `day(ts)`; Parquet with ZSTD, rows sorted by topic then
+  time in each file.
+- The cores append rows to column buffers (no allocation per message) and hand them over every
+  second, or every 4096 rows, with a non-blocking send. One archiver thread, kept off the
+  broker's cores, writes the files and commits a snapshot every `--archive-commit` seconds
+  (default 10) or every million rows: few, large files, as Iceberg wants.
+- Best effort: rows not committed yet are lost on a crash; if the archiver falls behind or the
+  catalog is down, rows are kept up to 4 million, then dropped and counted.
+- Without the `iceberg` feature (the default build), `--archive` refuses to start: the feature
+  brings about 600 crates.
+
+On the test VM, 1 000 000 msg/s of 64 bytes on one broker core: every message archived, 6
+million rows in 23 MB of Parquet (about 4 bytes per message, the bench payloads compress well).
+The archiver thread uses about 0.9 core for that, and buffers about 300 MB. The broker core
+stays at the same CPU time; at 500 000 msg/s its p99 latency goes from 2-4 ms to 8-14 ms (the
+two threads share memory bandwidth on the 4 vCPU VM). At 100 000 msg/s there is no measurable
+difference.
+
 **Not implemented:** bridges, clustering across machines.
 
 **Tests:**
@@ -176,6 +210,8 @@ each such topic, not 86 400 of them; commands on other topics keep their full hi
 - `tests/broker.rs`: 37 end-to-end tests with real TCP, TLS and WebSocket clients, MQTT 5 and
   3.1.1, on two cores, including a restart from snapshots and a kill -9 with the write-ahead log.
 - Unit tests for the codec, the index and authentication.
+- `tests/archive.rs` (with `--features iceberg`): messages published to the broker, read back
+  from the Iceberg table. The tables were also read with pyiceberg and DuckDB.
 - `tests/interop.sh`: 20 checks with `mosquitto_pub` / `mosquitto_sub`, MQTT 5, TLS and restart
   included.
 
@@ -188,6 +224,8 @@ croisette [--port 1883] [--cores 1,2] [--mode MODE] [--max-queued BYTES] [--max-
           [--tls-cert PEM --tls-key PEM [--tls-port 8883] [--wss-port P]] [--ws-port P]
           [--persist-dir DIR [--autosave S] [--storage none|snapshot|wal]
            [--fsync batch|interval:<ms>|never] [--durable-qos 1|2]] [--conflate FILTER]...
+          [--archive FILTER... --archive-catalog URI --archive-warehouse URI
+           [--archive-table NS.TABLE] [--archive-commit S] [--archive-prop KEY=VALUE]...]
 croisette hash-password USER PASSWORD
 ```
 

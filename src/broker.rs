@@ -26,6 +26,7 @@ use std::time::Duration;
 
 use cannes::{Actor, ActorId, ActorRef, Context, CoreId, CoreMode, Engine, Handler, IoCompletion, StartSequence};
 
+use crate::archive::{self, ArchiveSender, Rows};
 use crate::auth::{self, Auth, Rule};
 use crate::codec::{self, prop, reason, Packet};
 use crate::index::{Entry, Sub, SubIndex};
@@ -942,6 +943,9 @@ pub struct Connections {
     wal_seq: u64,
     wal: Option<Box<WalWriter>>,
     drained: bool,
+    /// Archive tier: the filters and the way to the archiver, and the rows not sent to it yet.
+    archive: Option<ArchiveSender>,
+    archive_rows: Rows,
     /// Snapshot directory and period in ticks, and the snapshot file being written.
     persist: Option<PathBuf>,
     autosave: u32,
@@ -1111,6 +1115,31 @@ impl Connections {
         }
         if more {
             self.arm(ctx);
+        }
+    }
+
+    #[cold]
+    fn archive(&mut self, topic: &str, payload: &[u8], qos: u8, retain: bool, from: Option<u64>) {
+        let ts_us = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_micros());
+        // The publisher's client id, borrowed from `conns` while `archive_rows` grows.
+        let (conns, generations) = (&self.conns, &self.generations);
+        let conn = from.and_then(|id| {
+            let index = (id & 0xffff_ffff) as usize;
+            let generation = (*generations.get(index)? as u64 & 0xff_ffff) << 32 | index as u64;
+            (generation == id & 0x00ff_ffff_ffff_ffff).then(|| conns[index].as_ref()).flatten()
+        });
+        let client_id = conn.and_then(|c| c.client_id.as_deref()).unwrap_or("");
+        self.archive_rows.push(ts_us as i64, topic, payload, qos, retain, client_id);
+        if self.archive_rows.len() >= archive::BATCH_ROWS {
+            self.send_archive_rows();
+        }
+    }
+
+    fn send_archive_rows(&mut self) {
+        if let Some(a) = &self.archive {
+            if !self.archive_rows.is_empty() {
+                a.send(std::mem::take(&mut self.archive_rows));
+            }
         }
     }
 
@@ -1440,6 +1469,7 @@ impl Connections {
             self.publish_will(ctx, &will);
         }
         self.forwards.retain(|_, f| tick.wrapping_sub(f.2) <= 2);
+        self.send_archive_rows();
         if self.topology.drain.load(std::sync::atomic::Ordering::Relaxed) && !self.drained {
             // Stopping: every connection closes now, handing its session to the context tier.
             self.drained = true;
@@ -1770,6 +1800,9 @@ impl Connections {
         retained: bool,
         from: Option<u64>,
     ) -> usize {
+        if self.archive.as_ref().is_some_and(|a| a.matches(topic)) {
+            self.archive(topic, payload, qos, retained, from);
+        }
         let here = self.core(ctx);
         let mut targets = std::mem::take(&mut self.targets);
         targets.clear();
@@ -2328,6 +2361,8 @@ pub struct Config {
     pub drain: Arc<std::sync::atomic::AtomicBool>,
     /// Topic filters whose messages queued for offline sessions keep only the last per topic.
     pub conflate: Arc<[Box<str>]>,
+    /// Archive tier (see `archive::Archiver`).
+    pub archive: Option<ArchiveSender>,
 }
 
 impl Default for Config {
@@ -2353,6 +2388,7 @@ impl Default for Config {
             wal: None,
             drain: Arc::default(),
             conflate: Arc::new([]),
+            archive: None,
         }
     }
 }
@@ -2371,6 +2407,7 @@ pub fn start(config: &Config) -> std::io::Result<Engine> {
     let topology = Arc::new(Topology { cores: config.cores.clone(), drain: config.drain.clone() });
     let (mut restored, wal_seq) = restore(config, &topology)?;
     let wal_config = config.wal;
+    let archive = config.archive.clone();
     let wal_on = config.wal.is_some();
     let mut seq = StartSequence::new();
     for &core in &config.cores {
@@ -2422,6 +2459,7 @@ pub fn start(config: &Config) -> std::io::Result<Engine> {
             c
         });
         let t = topology.clone();
+        let archive = archive.clone();
         let n = seq.add_actor(core, move || Connections {
             topology: t,
             listeners,
@@ -2452,6 +2490,8 @@ pub fn start(config: &Config) -> std::io::Result<Engine> {
             wal_config,
             wal_seq,
             drained: false,
+            archive: archive.clone(),
+            archive_rows: Rows::default(),
             autosave,
             saving: None,
             conns: Vec::new(),

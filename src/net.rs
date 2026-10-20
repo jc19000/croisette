@@ -41,6 +41,8 @@ extern "C" {
     fn sigaddset(set: *mut SigSet, sig: i32) -> i32;
     fn pthread_sigmask(how: i32, set: *const SigSet, old: *mut SigSet) -> i32;
     fn sigwait(set: *const SigSet, sig: *mut i32) -> i32;
+    fn sched_getaffinity(pid: i32, size: usize, mask: *mut u64) -> i32;
+    fn sched_setaffinity(pid: i32, size: usize, mask: *const u64) -> i32;
     #[link_name = "shutdown"]
     fn shutdown_fd(fd: i32, how: i32) -> i32;
 }
@@ -60,6 +62,19 @@ fn check(ret: i32) -> io::Result<i32> {
     } else {
         Ok(ret)
     }
+}
+
+/// Keeps the calling thread off `cores` (those of the broker), on the other CPUs it may use.
+pub fn avoid_cores(cores: &[usize]) -> io::Result<()> {
+    let mut mask = [0u64; 16]; // 1024 CPUs
+    check(unsafe { sched_getaffinity(0, std::mem::size_of_val(&mask), mask.as_mut_ptr()) })?;
+    for &c in cores.iter().filter(|&&c| c < 1024) {
+        mask[c / 64] &= !(1 << (c % 64));
+    }
+    if mask.iter().all(|&m| m == 0) {
+        return Ok(()); // nothing else to run on
+    }
+    check(unsafe { sched_setaffinity(0, std::mem::size_of_val(&mask), mask.as_ptr()) }).map(|_| ())
 }
 
 fn set_int(fd: RawFd, level: i32, name: i32, value: i32) -> io::Result<()> {

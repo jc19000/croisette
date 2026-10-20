@@ -3,7 +3,7 @@ name = "croisette"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.82"
-description = "Proof of concept: an MQTT 3.1.1 broker on the cannes thread-per-core actor engine, with io_uring"
+description = "Proof of concept: an MQTT 5 and 3.1.1 broker on the cannes thread-per-core actor engine, with io_uring"
 license = "Apache-2.0"
 repository = "https://github.com/jc19000/croisette"
 publish = false
@@ -14,6 +14,37 @@ cannes = { version = "0.2", git = "https://github.com/jc19000/cannes", branch = 
 
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2"
+
+# Archive tier (--archive), off by default: it brings a few hundred crates.
+iceberg = { version = "0.10.1", optional = true }
+iceberg-catalog-sql = { version = "0.10.1", optional = true }
+iceberg-catalog-rest = { version = "0.10.1", optional = true }
+iceberg-storage-opendal = { version = "0.10.1", optional = true }
+arrow-array = { version = "58", optional = true }
+arrow-buffer = { version = "58", optional = true }
+arrow-schema = { version = "58", optional = true }
+arrow-select = { version = "58", optional = true }
+parquet = { version = "58", optional = true, default-features = false, features = ["zstd"] }
+tokio = { version = "1", optional = true, features = ["rt", "time"] }
+futures = { version = "0.3", optional = true }
+# The SQL catalog's drivers: SQLite, on tokio.
+sqlx = { version = "0.8", optional = true, default-features = false, features = ["runtime-tokio", "sqlite", "any"] }
+
+[features]
+iceberg = [
+    "dep:iceberg",
+    "dep:iceberg-catalog-sql",
+    "dep:iceberg-catalog-rest",
+    "dep:iceberg-storage-opendal",
+    "dep:arrow-array",
+    "dep:arrow-buffer",
+    "dep:arrow-schema",
+    "dep:arrow-select",
+    "dep:parquet",
+    "dep:tokio",
+    "dep:futures",
+    "dep:sqlx",
+]
 
 [profile.release]
 opt-level = 3

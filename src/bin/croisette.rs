@@ -7,6 +7,9 @@
 //!        [--persist-dir DIR [--autosave SECONDS]] [--storage none|snapshot|wal]
 //!        [--fsync batch|interval:<ms>|never] [--durable-qos 1|2]
 //!        [--conflate FILTER]...
+//!        [--archive FILTER]... --archive-catalog sqlite:PATH|http(s)://REST --archive-warehouse
+//!        file:///DIR|s3://BUCKET/PATH [--archive-table mqtt.messages] [--archive-commit SECONDS]
+//!        [--archive-prop KEY=VALUE]...     (with --features iceberg)
 //!        croisette hash-password USER PASSWORD     (prints a password file line)
 //!
 //! MODE: `spin`, `adaptive` (2000 idle loops, then 1 ms sleeps), `adaptive:<loops>:<µs>`,
@@ -36,6 +39,7 @@ fn main() {
     let (mut tls_cert, mut tls_key) = (None, None);
     let mut storage = None;
     let mut conflate: Vec<Box<str>> = Vec::new();
+    let mut archive = croisette::archive::ArchiveConfig::default();
     let mut wal = croisette::wal::WalConfig::default();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -84,6 +88,18 @@ fn main() {
                 assert!(croisette::codec::valid_filter(&value), "--conflate {value}: not a topic filter");
                 conflate.push(value.into());
             }
+            "--archive" => {
+                assert!(croisette::codec::valid_filter(&value), "--archive {value}: not a topic filter");
+                archive.filters.push(value.into());
+            }
+            "--archive-catalog" => archive.catalog = value,
+            "--archive-warehouse" => archive.warehouse = value,
+            "--archive-table" => archive.table = value,
+            "--archive-commit" => archive.commit_interval = Duration::from_secs(value.parse().expect("seconds")),
+            "--archive-prop" => {
+                let (k, v) = value.split_once('=').expect("--archive-prop KEY=VALUE");
+                archive.props.push((k.into(), v.into()));
+            }
             "--durable-qos" => wal.durable_qos = value.parse().expect("1 or 2"),
             "--acl" => acl = Some(PathBuf::from(value)),
             "--allow-anonymous" => anonymous = value.parse().expect("true or false"),
@@ -119,6 +135,14 @@ fn main() {
         Some(other) => panic!("--storage none|snapshot|wal, not {other}"),
     }
     config.conflate = conflate.into();
+    // Archive tier: started first, so that a wrong catalog stops the start-up.
+    let archiver = (!archive.filters.is_empty()).then(|| {
+        assert!(!archive.catalog.is_empty(), "--archive needs --archive-catalog");
+        assert!(!archive.warehouse.is_empty(), "--archive needs --archive-warehouse");
+        archive.avoid_cores = config.cores.clone();
+        croisette::archive::Archiver::start(&archive).unwrap_or_else(|e| panic!("{e}"))
+    });
+    config.archive = archiver.as_ref().map(|a| a.sender());
     croisette::net::block_termination_signals();
     let engine = broker::start(&config).expect("broker start");
     let mut extra = config.tls.as_ref().map(|_| format!(", TLS on port {}", config.tls_port)).unwrap_or_default();
@@ -132,4 +156,7 @@ fn main() {
     let sig = croisette::net::wait_for_termination();
     eprintln!("croisette: signal {sig}, stopping");
     broker::stop(engine, &config); // closes the connections, writes the snapshots
+    if let Some(a) = archiver {
+        a.stop(); // commits the last rows
+    }
 }
